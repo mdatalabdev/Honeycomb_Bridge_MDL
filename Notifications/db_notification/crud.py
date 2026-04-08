@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy import func
+from sqlalchemy import func, cast, String
 from .models import Notification, NotificationAction
 from sqlalchemy import or_, desc, asc
 from Notifications.db_notification.models import Notification
@@ -11,6 +11,8 @@ def get_notifications(
     status: str = None,
     search: str = None,
     severity: str = None,
+    asset: str = None,
+    device: str = None,
     start_time: int = None,   # epoch millis
     end_time: int = None,     # epoch millis
     limit: int = 50,
@@ -27,7 +29,19 @@ def get_notifications(
     #  Filter: severity
     if severity:
         query = query.filter(Notification.severity == severity)
-
+        
+    if asset:
+        query = query.filter(Notification.category == asset)
+        
+    if device:
+        devices = device.split("&")
+        query = query.filter(
+            or_(*[
+                cast(Notification.labels, String).ilike(f"%{d.strip()}%")
+                for d in devices if d.strip()
+            ])
+        )
+        
     #  Filter: date range (edgex_created)
     if start_time:
         query = query.filter(Notification.edgex_created >= start_time)

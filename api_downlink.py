@@ -1,5 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query, status, Path, Request, Depends, Body
 from fastapi.responses import JSONResponse
+from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
 import event_fetcher_parse as efp
 import User_token
 from SMTP_init import LoginAlertMailer
@@ -35,6 +37,7 @@ import config
 import re
 import uuid
 import threading
+import asyncio
 from fastapi import Query
 from fastapi.encoders import jsonable_encoder
 from Notifications.worker import run_notification_worker
@@ -2491,6 +2494,8 @@ async def get_notifications_api(
     status: str = Query(None),
     search: str = Query(None),
     severity: str = Query(None),
+    asset: str = Query(None),
+    device: str = Query(None),
     start_time: int = Query(None),   # epoch millis
     end_time: int = Query(None),
     limit: int = Query(50, le=200),
@@ -2506,6 +2511,8 @@ async def get_notifications_api(
             status=status,
             search=search,
             severity=severity,
+            asset=asset,
+            device=device,
             start_time=start_time,
             end_time=end_time,
             limit=limit,
@@ -2699,3 +2706,37 @@ async def get_closed_notifications_with_remarks(
     except Exception as e:
         logging.error(f"Failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch")
+    
+@app.websocket("/downlink/ws/notifications/{status}")
+async def websocket_notifications_by_status(
+    websocket: WebSocket,
+    status: str 
+):
+    await websocket.accept()
+
+    db = database.SessionLocal()  
+
+    try:
+        while True:
+            data = (
+                db.query(Notification)
+                .filter(Notification.status == status.upper())
+                .order_by(Notification.edgex_created.desc())
+                .limit(10)
+                .all()
+            )
+
+            await websocket.send_json({
+                "status": "success",
+                "count": len(data),
+                "data": jsonable_encoder(data)
+            })
+
+            # wait before sending again (polling style)
+            await asyncio.sleep(10)
+
+    except WebSocketDisconnect:
+        pass
+
+    finally:
+        db.close()
