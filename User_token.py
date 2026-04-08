@@ -188,9 +188,9 @@ def chirpstack_auth_http_rotation(jwt):
         """
         Fetches HTTP integration details and updates the Authorization header.
         """
-        Chirpstack_tenant_url = "http://10.12.82.105:8090/api/tenants"
-        Chirpstack_application_url = "http://10.12.82.105:8090/api/applications"
-        Chirpstack_http_integration_url = "http://10.12.82.105:8090/api/applications/{application_id}/integrations/http"
+        Chirpstack_tenant_url = "http://localhost:8090/api/tenants"
+        Chirpstack_application_url = "http://localhost:8090/api/applications"
+        Chirpstack_http_integration_url = "http://localhost:8090/api/applications/{application_id}/integrations/http"
 
         try:
             parameters = {
@@ -285,6 +285,44 @@ def chirpstack_auth_http_rotation(jwt):
         except requests.RequestException as req_err:
             logger.error(f"Failed to fetch ChirpStack application details: {req_err}")
 
+def admin_JWT_token_generator():
+    """Generates and uses JWT token for the admin user to fetch rules, modify Authorization, and update them."""
+
+    # Step 1: Read admin token from edgex_users.json
+    try:
+        with open(EDGEX_USERS_FILE, "r") as f:
+            data = json.load(f)
+        admin_entry = next((entry for entry in data if entry.get("username") == "admin"), None)
+
+        if not admin_entry or not admin_entry.get("token"):
+            logger.warning("Admin user not found or missing token in edgex_users.json.")
+            return
+
+        admin_token = admin_entry["token"]
+    except Exception as e:
+        logger.error(f"Error reading {EDGEX_USERS_FILE}: {e}")
+        return
+
+    # Step 2: Use admin token to get fresh JWT
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {admin_token}'
+    }
+
+    try:
+        response = requests.get(ADMIN_TOKEN_URL, headers=headers)
+        response.raise_for_status()
+
+        jwt_token = response.json().get("data", {}).get("token")
+        if not jwt_token:
+            logger.warning("No JWT token found for admin.")
+            return
+
+        logger.info("JWT token fetched for admin.")
+
+    except requests.RequestException as req_err:
+        logger.error(f"Failed to fetch admin JWT token: {req_err}")
+        return
 
 def Jwt_rotaion_all():
     """

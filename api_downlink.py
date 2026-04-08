@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, status, Path, Request, Depends, Body
+from fastapi import FastAPI, HTTPException, Query, status, Path, Request, Depends, Body
 from fastapi.responses import JSONResponse
 import event_fetcher_parse as efp
 import User_token
@@ -34,6 +34,13 @@ import requests
 import config
 import re
 import uuid
+import threading
+from fastapi import Query
+from fastapi.encoders import jsonable_encoder
+from Notifications.worker import run_notification_worker
+from Notifications.db_notification.models import Notification, NotificationAction
+from Notifications.schema import CloseNotificationRequest, NotificationResponse
+from Notifications.db_notification.crud import get_notifications, get_last_notification_timestamp, close_notification, get_notifications_by_status
 from captcha_utils import (
     redis_client,
     generate_captcha_text,
@@ -54,6 +61,23 @@ app = FastAPI(
 CONFIG_FILE = "config-api.json"
 JSON_FILE = "edgex_users.json"
 SUPERSET_CONTAINER = "superset_app"
+
+# Woker thread to pull notifications from edgex and store in DB
+worker_started = False
+
+
+@app.on_event("startup")
+def start_worker():
+    global worker_started
+
+    if not worker_started:
+        thread = threading.Thread(
+            target=run_notification_worker,
+            args=(5,),
+            daemon=True
+        )
+        thread.start()
+        worker_started = True
 
 #AUTH_API ------------------------------------------------------------------
 
@@ -2453,4 +2477,225 @@ async def delete_stored_predictions_specific(
             status_code=500,
             detail="Failed to delete stored predictions"
         )
-        
+
+############################################################################################
+# Notifications NEW --> REMARK --> CLOSE
+############################################################################################
+
+@app.get(
+    "/downlink/notifications",
+    summary="Fetch notifications with filtering, pagination and sorting"
+)
+
+async def get_notifications_api(
+    status: str = Query(None),
+    search: str = Query(None),
+    severity: str = Query(None),
+    start_time: int = Query(None),   # epoch millis
+    end_time: int = Query(None),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0),
+    sort_by: str = Query("edgex_created"),
+    order: str = Query("desc"),
+    db: Session = Depends(get_db),
+    current_user=Depends(auth.get_current_user)
+):
+    try:
+        total, data = get_notifications(
+            db=db,
+            status=status,
+            search=search,
+            severity=severity,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by,
+            order=order
+        )
+
+        return {
+            "status": "success",
+            "total": total,     
+            "count": len(data),
+            "data": data
+        }
+
+    except Exception as e:
+        logging.error(f"Failed to fetch notifications: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch notifications")
+    
+@app.get(
+    "/downlink/notifications/stats",
+    summary="Get notification stats"
+)
+async def get_notification_stats(
+    db: Session = Depends(get_db),
+    current_user=Depends(auth.get_current_user)
+):
+    try:
+        new_count = db.query(Notification).filter(Notification.status == "NEW").count()
+        closed_count = db.query(Notification).filter(Notification.status == "CLOSED").count()
+
+        return {
+            "status": "success",
+            "data": {
+                "NEW": new_count,
+                "CLOSED": closed_count
+            }
+        }
+
+    except Exception as e:
+        logging.error(f"Failed to fetch stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch stats")  
+    
+@app.get(
+    "/downlink/notifications/{notification_id}",
+    summary="Get a specific notification"
+)
+async def get_notification_by_id(
+    notification_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(auth.get_current_user)
+):
+    try:
+        notif = db.query(Notification).filter(Notification.id == notification_id).first()
+
+        if not notif:
+            raise HTTPException(status_code=404, detail="Notification not found")
+
+        return {
+            "status": "success",
+            "data": notif
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to fetch notification: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch notification")
+    
+@app.post(
+    "/downlink/notifications/method-close/{notification_id}",
+    summary="Close notification with remark"
+)
+async def close_notification_def(
+    notification_id: str,
+    request: CloseNotificationRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(auth.get_current_user)
+):
+    try:
+        notif = close_notification(
+            db,
+            notification_id,
+            request.remark,
+            request.user # or user id
+        )
+
+        if not notif:
+            raise HTTPException(status_code=404, detail="Notification not found")
+
+        return {
+            "status": "success",
+            "message": "Notification closed successfully"
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logging.error(f"Failed to close notification: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to close notification")
+    
+
+@app.get("/downlink/notifications/{status}")
+
+async def get_notifications_by_status_api(
+    status: str,
+    limit: int = Query(50, le=200),
+    offset: int = Query(0),
+    db: Session = Depends(get_db),
+    current_user=Depends(auth.get_current_user)
+):
+    try:
+        data = (
+            db.query(Notification)
+            .filter(Notification.status == status.upper())
+            .order_by(Notification.edgex_created.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+        return {
+            "status": "success",
+            "count": len(data),
+            "data": jsonable_encoder(data)
+        }
+
+    except Exception as e:
+        logging.error(f"Failed to fetch notifications: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch notifications")
+    
+    
+@app.get("/downlink/notifications/actions/closed_remarks")
+async def get_closed_notifications_with_remarks(
+    limit: int = Query(50, le=200),
+    offset: int = Query(0),
+    db: Session = Depends(get_db),
+    current_user=Depends(auth.get_current_user)
+):
+    try:
+        subquery = (
+            db.query(
+                NotificationAction.notification_id,
+                NotificationAction.remark,
+                NotificationAction.performed_by,
+                NotificationAction.performed_at
+            )
+            .order_by(
+                NotificationAction.notification_id,
+                NotificationAction.performed_at.desc()
+            )
+            .distinct(NotificationAction.notification_id)
+            .subquery()
+        )
+
+        results = (
+            db.query(
+                Notification,
+                subquery.c.remark,
+                subquery.c.performed_by,
+                subquery.c.performed_at
+            )
+            .join(subquery, Notification.id == subquery.c.notification_id)
+            .filter(Notification.status == "CLOSED")
+            .order_by(Notification.edgex_created.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+        data = [
+            {
+                "notification": jsonable_encoder(notif),
+                "remark": remark,
+                "performed_by": performed_by,
+                "performed_at": performed_at
+            }
+            for notif, remark, performed_by, performed_at in results
+        ]
+
+        return {
+            "status": "success",
+            "count": len(data),
+            "data": data
+        }
+
+    except Exception as e:
+        logging.error(f"Failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch")
