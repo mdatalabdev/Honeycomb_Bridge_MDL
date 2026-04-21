@@ -11,8 +11,16 @@ from Predictive_ML.ml.trainers.lstm import train_lstm
 import numpy as np
 import torch
 from sklearn.metrics import confusion_matrix
+from sklearn.preprocessing import StandardScaler
+import torch
 
-def create_sequences(df, feature_cols, target_col, seq_length, horizon_steps, prediction_type):
+#  Device selection (GPU if available, else CPU)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f"Using device: {device}")
+
+
+def create_sequences(df, feature_cols, target_col, seq_length, horizon_steps, prediction_type,thresholds=None):
     X, y = [], []
 
     for i in range(len(df) - seq_length - horizon_steps + 1):
@@ -121,7 +129,9 @@ def covert_csv_to_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # 🔹 Sort by time
     final_df = final_df.sort_values("window_start")
-
+    logging.info(
+    f"Converted CSV to shape: {final_df.shape}, columns: {list(final_df.columns)}")
+    
     return final_df
 
 def convert_telemetry_to_dataframe_for_prediction(df: pd.DataFrame) -> pd.DataFrame:
@@ -171,7 +181,9 @@ def convert_telemetry_to_dataframe_for_prediction(df: pd.DataFrame) -> pd.DataFr
 
     return final_df
     
-
+'''
+if prediction_type == "fault" then all the 3 algorithms can be used but if prediction_type is "sensor" then only LSTM can be used since RF and XGBoost are not good for regression problems with time series data.
+'''
 class TrainService:
 
     async def train(
@@ -208,14 +220,15 @@ class TrainService:
             col for col in df.columns
             if col not in ["window_start", "status", target_column]
         ]
-
+        scaler = StandardScaler()
+        df[feature_cols] = scaler.fit_transform(df[feature_cols])
         # =========================================================
         #  LSTM (SEQUENCE MODEL)
         # =========================================================
         if algorithm == "lstm":
             
 
-            seq_length = 20  # can be made configurable
+            seq_length = 10  
 
             X_seq, y_seq = create_sequences(
                 df,
@@ -229,7 +242,7 @@ class TrainService:
             if len(X_seq) == 0:
                 raise ValueError("Not enough data to create sequences")
 
-            model = train_lstm(X_seq, y_seq, prediction_type)
+            model = train_lstm(X_seq, y_seq, prediction_type,device=device)
 
             metrics = {
                 "info": "LSTM trained (basic metrics not implemented)"
@@ -301,6 +314,7 @@ class TrainService:
             "metadata": metadata
         }
         
+
     async def train_specific_model(
         self,
         labeled_data: list,
@@ -314,7 +328,9 @@ class TrainService:
         random_state: int = 42,
         freq_minutes: int = 5
     ) -> Dict[str, Any]:
-
+        '''
+        if prediction_type == "fault" then all the 3 algorithms can be used but if prediction_type is "sensor" then only LSTM can be used since RF and XGBoost are not good for regression problems with time series data.
+        '''
         df = pd.DataFrame(labeled_data)
 
         # 🔹 Convert telemetry → wide format
@@ -346,13 +362,14 @@ class TrainService:
             col for col in df.columns
             if col not in ["window_start", "status", target_column]
         ]
-
+        scaler = StandardScaler()
+        df[feature_cols] = scaler.fit_transform(df[feature_cols])
         # =========================================================
         # LSTM (SEQUENCE MODEL)
         # =========================================================
         if algorithm == "lstm":
 
-            seq_length = 20
+            seq_length = 10
 
             X_seq, y_seq = create_sequences(
                 df,
@@ -360,13 +377,15 @@ class TrainService:
                 target_col=target_column,
                 seq_length=seq_length,
                 horizon_steps=steps,
-                prediction_type=prediction_type
+                prediction_type=prediction_type,
+                thresholds=thresholds
             )
 
             if len(X_seq) == 0:
                 raise ValueError("Not enough data to create sequences")
 
-            model = train_lstm(X_seq, y_seq, prediction_type)
+            model = train_lstm(X_seq, y_seq, prediction_type,device=device)
+
 
             metrics = {
                 "info": "LSTM trained (basic metrics not implemented)"
@@ -442,7 +461,9 @@ class TrainService:
 
     @staticmethod
     async def future_predict(data, model, metadata):
-
+        '''
+        if prediction_type == "fault" then all the 3 algorithms can be used but if prediction_type is "sensor" then only LSTM can be used since RF and XGBoost are not good for regression problems with time series data.
+        '''
         if not data:
             logging.error("No data received for prediction.")
             return None
@@ -478,11 +499,16 @@ class TrainService:
                 raise ValueError("Not enough data for LSTM")
 
             seq = df.iloc[-seq_len:][expected_features].values
-            X = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
-
+            X = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(device)
+            print(type(model))
+            print(model)
+            if isinstance(model, tuple):
+                model = model[0]
+            model = model.to(device)
             model.eval()
             with torch.no_grad():
-                output = model(X).numpy().flatten()
+                output = model(X).cpu().numpy().flatten()
+                output = np.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
 
             base_ts = df["window_start"].iloc[-1]
 
@@ -500,7 +526,10 @@ class TrainService:
 
             # 🔹 Sensor
             else:
-                values = output.tolist()
+                values = [
+                    float(x) if np.isfinite(x) else 0.0
+                    for x in output.tolist()
+                ]
                 probs = None
                 confidence = [1.0] * len(values)
                 cm = None
@@ -573,12 +602,13 @@ class TrainService:
                     "mode": "single_step",
                     "horizon": horizon
                 }
-            }
-
-    
+            }      
+            
     @staticmethod
     async def predict_future_asset(df: pd.DataFrame, model, metadata: dict) -> dict:
-
+        '''
+    if prediction_type == "fault" then all the 3 algorithms can be used but if prediction_type is "sensor" then only LSTM can be used since RF and XGBoost are not good for regression problems with time series data.
+        '''
 
         if df.empty:
             logging.error("Empty DataFrame received for asset prediction.")
@@ -612,12 +642,16 @@ class TrainService:
                 raise ValueError("Not enough data for LSTM prediction")
 
             seq = df.iloc[-seq_len:][expected_features].values
-            X = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
+            X = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(device)
+
+            if isinstance(model, tuple):
+                model = model[0]
+            model = model.to(device)
 
             model.eval()
             with torch.no_grad():
-                output = model(X).numpy().flatten()
-
+                output = model(X).cpu().numpy().flatten()
+                output = np.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
             base_ts = df["window_start"].iloc[-1]
 
             timestamps = [
@@ -631,7 +665,10 @@ class TrainService:
                 confidence = [abs(p - 0.5) * 2 for p in probs]
                 cm = None
             else:
-                values = output.tolist()
+                values = [
+                    float(x) if np.isfinite(x) else 0.0
+                    for x in output.tolist()
+                ]
                 probs = None
                 confidence = [1.0] * len(values)
                 cm = None
