@@ -1,4 +1,3 @@
-
 import pandas as pd 
 import logging
 
@@ -56,8 +55,8 @@ def label_motor_faults(window_df, thresholds):
         # -------------------------------
         if (
             vib is not None and temp is not None and
-            vib >= thresholds["vibration"]["failure"] and
-            temp >= thresholds["temperature"]["failure"]
+            vib >= thresholds["Vibration_avg"]["failure"] and
+            temp >= thresholds["Temperature_avg"]["failure"]
         ):
             label = 4
 
@@ -67,7 +66,7 @@ def label_motor_faults(window_df, thresholds):
         # -------------------------------
         elif (
             stator_i is not None and
-            stator_i >= thresholds["stator_current"]["failure"]
+            stator_i >= thresholds["Stator_Current_avg"]["failure"]
         ):
             label = 3
 
@@ -77,7 +76,7 @@ def label_motor_faults(window_df, thresholds):
         # -------------------------------
         elif (
             rotor_i is not None and
-            rotor_i >= thresholds["rotor_current"]["failure"]
+            rotor_i >= thresholds["Rotor_Current_avg"]["failure"]
         ):
             label = 2
 
@@ -87,8 +86,8 @@ def label_motor_faults(window_df, thresholds):
         # -------------------------------
         elif (
             stator_i is not None and temp is not None and
-            stator_i >= thresholds["stator_current"]["prefailure"] and
-            temp >= thresholds["temperature"]["prefailure"]
+            stator_i >= thresholds["Stator_Current_avg"]["prefailure"] and
+            temp >= thresholds["Temperature_avg"]["prefailure"]
         ):
             label = 1
 
