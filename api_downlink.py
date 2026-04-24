@@ -2154,8 +2154,8 @@ async def set_sensor_mapping(
             detail="Failed to store sensor mapping"
         )
         
-@app.get(
-    "/downlink/predictive_ML/model/sensor-mapping",
+@app.post(
+    "/downlink/predictive_ML/model/sensor-mapping/getSensorDetails",
     summary="Get sensor mapping for a model"
 )
 async def get_sensor_mapping(
