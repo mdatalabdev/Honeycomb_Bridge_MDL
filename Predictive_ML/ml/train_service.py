@@ -517,13 +517,15 @@ class TrainService:
             if len(df) < seq_len:
                 raise ValueError("Not enough data for LSTM")
 
-            seq = df.iloc[-seq_len:][expected_features].values
+            seq_df = df.iloc[-seq_len:][expected_features]
 
             scaler = None
             if isinstance(model, tuple):
                 model, scaler = model
             if scaler is not None:
-                seq = scaler.transform(seq)
+                seq = scaler.transform(seq_df)
+            else:
+                seq = seq_df.values
 
             X = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(device)
             model = model.to(device)
@@ -560,7 +562,7 @@ class TrainService:
                         hist_y = np.array([int(label_vals[i+seq_len]) for i in range(n)])
                         if scaler is not None:
                             s, t, f = hist_X.shape
-                            hist_X = scaler.transform(hist_X.reshape(-1, f)).reshape(s, t, f)
+                            hist_X = scaler.transform(pd.DataFrame(hist_X.reshape(-1, f), columns=expected_features)).reshape(s, t, f)
                         X_hist = torch.tensor(hist_X, dtype=torch.float32).to(device)
                         with torch.no_grad():
                             hist_preds = np.argmax(model(X_hist).cpu().numpy(), axis=1)
@@ -686,13 +688,15 @@ class TrainService:
             if len(df) < seq_len:
                 raise ValueError("Not enough data for LSTM prediction")
 
-            seq = df.iloc[-seq_len:][expected_features].values
+            seq_df = df.iloc[-seq_len:][expected_features]
 
             scaler = None
             if isinstance(model, tuple):
                 model, scaler = model
             if scaler is not None:
-                seq = scaler.transform(seq)
+                seq = scaler.transform(seq_df)
+            else:
+                seq = seq_df.values
 
             X = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(device)
             model = model.to(device)
@@ -728,7 +732,7 @@ class TrainService:
                         hist_y = np.array([int(label_vals[i+seq_len]) for i in range(n)])
                         if scaler is not None:
                             s, t, f = hist_X.shape
-                            hist_X = scaler.transform(hist_X.reshape(-1, f)).reshape(s, t, f)
+                            hist_X = scaler.transform(pd.DataFrame(hist_X.reshape(-1, f), columns=expected_features)).reshape(s, t, f)
                         X_hist = torch.tensor(hist_X, dtype=torch.float32).to(device)
                         with torch.no_grad():
                             hist_preds = np.argmax(model(X_hist).cpu().numpy(), axis=1)
