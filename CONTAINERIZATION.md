@@ -19,6 +19,7 @@ infrastructure outside this stack.
 | 6 | `auth-db` | — | `postgres:15` | replaces the host-installed Postgres currently at `localhost:5435` |
 | 7 | `timescaledb` | existing `Timescale_db/docker-compose.yaml` | `timescale/timescaledb:2.14.2-pg15` | reused as-is, joins the shared network |
 | 8 | `redis` | — | `redis` (official) | used by `captcha_utils.py` |
+| 9 | `docker-ops-sidecar` | new, see below | `docker:25-cli` + python | only container that mounts `/var/run/docker.sock`; brokers the sibling `docker exec` calls on `api`'s behalf over an internal HTTP API |
 
 ## Network
 
@@ -46,15 +47,30 @@ network reference rather than duplicating them here.
    variables or a secrets manager before building images. Since these are already
    committed to git history, treat them as compromised and rotate regardless.
 
-2. **`docker exec` calls to sibling containers** (`api_downlink.py`, around lines
-   1200–1360) currently shell out to `chirpstack-chirpstack-1`,
-   `edgex-security-proxy-setup`, and `edgex-security-secretstore-setup` by container
-   name. This won't work from inside the `api` container without mounting
+2. **`docker exec` calls to sibling containers** (`api_downlink.py`) currently shell
+   out to four containers by name: `chirpstack-chirpstack-1` (create API key, ~line
+   1301), `edgex-security-proxy-setup` (create user, ~line 1244),
+   `edgex-security-secretstore-setup` (read the Vault root-init token, ~line 1342),
+   and `superset_app` (create user / change password, ~lines 1477 and 1620). This
+   won't work from inside the `api` container without mounting
    `/var/run/docker.sock`, which grants host-level Docker control to anything that
-   compromises that container. Preferred fix: replace these calls with the
-   equivalent APIs (ChirpStack gRPC, Vault HTTP) already used elsewhere in the
-   codebase. If that's not feasible short term, confine socket access to one
-   narrowly-scoped sidecar instead of the main API container.
+   compromises that container.
+
+   Decision: introduce `docker-ops-sidecar` (container #9 above) as the only thing
+   that mounts the socket. It's a minimal container exposing one HTTP endpoint per
+   operation above — not a generic exec passthrough — reachable only from `api` on
+   `honeycomb-net`. `api` calls it over HTTP instead of shelling out directly, so a
+   compromise of the internet-facing `api` container no longer implies host-level
+   Docker control. Each endpoint is deleted once its underlying operation is
+   migrated to a real API (ChirpStack gRPC `ApiKeyService.Create`, Vault HTTP for
+   the EdgeX proxy user and for reading secrets instead of `cat`-ing the root-init
+   file) — the sidecar is a bridge, not a permanent fixture.
+
+   Two pre-existing issues worth fixing regardless of this migration: the Vault
+   root-init token is read live via `docker exec cat` rather than coming from a
+   secrets manager, and the Superset password-change endpoint passes the old/new
+   password as plaintext argv into `python3 -c` inside the container (visible to
+   anything that can read that container's process list).
 
 3. **`localhost`-based URLs in `config.py`** need to become env-configurable service
    names/hostnames (`auth-db`, `timescaledb`, `redis`, plus the external hosts
@@ -65,15 +81,15 @@ network reference rather than duplicating them here.
    `postgresql://<user>:<password>@auth-db:5432/test_auth_db`, with the password
    sourced from a secret, not the `.env` file, in production.
 
-5. **Alembic migrations** (`alembic/versions/*`) should run as a one-shot init step
-   (init container or entrypoint check) before `api`/`iot-worker` start, rather than
-   relying on someone running `alembic upgrade head` manually on the host.
+Note: Alembic (`alembic/versions/*`) is intentionally **out of scope** — it keeps
+running as-is (manual `alembic upgrade head` on the host), not as a container or
+init step.
 
 ## Next Steps
 
 - [ ] Write Dockerfiles for `api`, `iot-worker`, `notifications-worker`,
-      `backup-worker`, `ml-service`
-- [ ] Write `docker-compose.yml` wiring all 8 containers + external network reference
+      `backup-worker`, `ml-service`, `docker-ops-sidecar`
+- [ ] Write `docker-compose.yml` wiring all 9 containers + external network reference
 - [ ] Move secrets out of `config.py` into env vars / secret store
-- [ ] Refactor `docker exec` calls into API calls
-- [ ] Add migration init step for `auth-db`
+- [ ] Point the 5 `docker exec` call sites in `api_downlink.py` at `docker-ops-sidecar`
+      over HTTP instead of shelling out directly
