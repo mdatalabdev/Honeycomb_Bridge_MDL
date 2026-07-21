@@ -2,10 +2,10 @@ import logging
 import config
 import grpc
 
-from application_fetcher import ApplicationFetcher
-from device_fetcher import DeviceFetcher
-from tenant_fetcher import TenantFetcher
-from codec_fetcher import CodecFetcher
+from iot_worker.application_fetcher import ApplicationFetcher
+from iot_worker.device_fetcher import DeviceFetcher
+from iot_worker.tenant_fetcher import TenantFetcher
+from iot_worker.codec_fetcher import CodecFetcher
 from chirpstack_api import api
 from rich.console import Console
 from rich.table import Table

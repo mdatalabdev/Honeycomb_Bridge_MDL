@@ -1,10 +1,10 @@
 import logging
-from key_rotation import KeyManager, SharedKey, SensorCrypto
+from iot_worker.key_rotation import KeyManager, SharedKey, SensorCrypto
 from binascii import hexlify
-from device_manager import device_manager
+from iot_worker.device_manager import device_manager
 import js2py
 import config
-from send_http_request import HttpSender
+from iot_worker.send_http_request import HttpSender
 import grpc
 import json
 import paho.mqtt.client as mqtt

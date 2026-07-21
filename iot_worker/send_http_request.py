@@ -3,7 +3,7 @@ import grpc
 import requests
 import config
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from http_integration_fetcher import HttpIntegration  
+from iot_worker.http_integration_fetcher import HttpIntegration
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

@@ -1,7 +1,7 @@
 import schedule
 import time
-from device_manager import device_manager
-import User_token
+from iot_worker.device_manager import device_manager
+from iot_worker import User_token
 
 def scheduled_update():
     """Fetch and display updated device list."""
