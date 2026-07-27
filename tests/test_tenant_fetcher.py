@@ -2,7 +2,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 import grpc
 from chirpstack_api import api
-from tenant_fetcher import TenantFetcher
+from iot_worker.tenant_fetcher import TenantFetcher
 import config
 
 @pytest.fixture

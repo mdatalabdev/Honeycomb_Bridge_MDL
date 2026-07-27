@@ -9,8 +9,12 @@ Set these in your environment or .env for production:
 """
 
 import os
+from pathlib import Path
 
 import psycopg2
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 APP_DB_URL = os.environ.get("DATABASE_URL", "")
 

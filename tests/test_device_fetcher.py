@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 from google.protobuf.timestamp_pb2 import Timestamp
 import config
-from device_fetcher import DeviceFetcher  
+from iot_worker.device_fetcher import DeviceFetcher  
 
 # Setup logging for tests
 logger = logging.getLogger(__name__)

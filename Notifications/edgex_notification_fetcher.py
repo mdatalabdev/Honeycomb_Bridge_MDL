@@ -1,5 +1,5 @@
 from time import time
-from User_token import admin_JWT_token_generator
+from iot_worker.User_token import admin_JWT_token_generator
 import logging
 import requests
 import config

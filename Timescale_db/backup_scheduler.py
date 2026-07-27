@@ -2,7 +2,12 @@
 backup_scheduler.py — Singleton APScheduler for daily automated backups.
 
 Import this module wherever you need to start the scheduler or manage the schedule.
-Call start_backup_scheduler() once at startup (from main.py or api startup).
+start_backup_scheduler() is called once, at startup, by the backup-worker container
+(Timescale_db/worker.py) — the only process that actually runs these jobs. api_downlink.py
+also imports apply_schedule()/apply_nas_schedule()/etc. from here, but only for their
+CronTrigger validation and same-request next_run preview side effects — its own
+_scheduler instance is never started, since the real jobs must only run once, in
+backup-worker.
 
 SMTP alerts: reads SMTP credentials from the parent project's config.py automatically.
 On failure the alert goes to SMTP_USERNAME (same as sender) unless
@@ -707,15 +712,14 @@ if _AVAILABLE:
             replace_existing=True,
         )
 
-    def start_backup_scheduler() -> None:
+    def _sync_jobs_with_disk() -> None:
         """
-        Start the scheduler and restore any saved schedule from schedule.json.
-        Safe to call multiple times — no-op if already running.
-        Call this once at application startup.
+        (Re-)register a job for each schedule JSON file that exists on disk, and
+        remove any job whose file has since been deleted. Used both at startup
+        (restoring whatever was saved before a restart) and by reload_jobs()
+        (re-syncing live after api_downlink.py writes/deletes a schedule file
+        from a separate container — see docker-compose.yml's note on this).
         """
-        if _scheduler.running:
-            return
-
         if os.path.exists(SCHEDULE_FILE):
             try:
                 with open(SCHEDULE_FILE) as f:
@@ -732,6 +736,8 @@ if _AVAILABLE:
                 )
             except Exception as e:
                 _log.warning(f"Could not restore saved schedule: {e}")
+        elif _scheduler.get_job("daily_backup"):
+            _scheduler.remove_job("daily_backup")
 
         if os.path.exists(NAS_SCHEDULE_FILE):
             try:
@@ -758,6 +764,8 @@ if _AVAILABLE:
                 )
             except Exception as e:
                 _log.warning(f"Could not restore saved NAS schedule: {e}")
+        elif _scheduler.get_job("daily_nas_backup"):
+            _scheduler.remove_job("daily_nas_backup")
 
         if os.path.exists(RESTORE_SCHEDULE_FILE):
             try:
@@ -776,6 +784,8 @@ if _AVAILABLE:
                 )
             except Exception as e:
                 _log.warning(f"Could not restore saved restore schedule: {e}")
+        elif _scheduler.get_job("daily_restore"):
+            _scheduler.remove_job("daily_restore")
 
         for imp_file, imp_target in (
             (IMPORT_BACKUP_SCHEDULE_FILE, "backup"),
@@ -808,6 +818,34 @@ if _AVAILABLE:
                     )
                 except Exception as e:
                     _log.warning(f"Could not restore saved import schedule ({imp_target}): {e}")
+            else:
+                job_id = f"daily_import_{imp_target}"
+                if _scheduler.get_job(job_id):
+                    _scheduler.remove_job(job_id)
+
+    def reload_jobs() -> None:
+        """
+        Re-sync registered jobs with the current on-disk schedule JSON files.
+        Safe to call any time after the scheduler is running — e.g. from the
+        /reload HTTP endpoint that api_downlink.py hits right after writing or
+        deleting a schedule file, so the change takes effect immediately
+        instead of waiting for this container to restart.
+        """
+        if not _scheduler.running:
+            _log.warning("reload_jobs() called before the scheduler was started — ignoring")
+            return
+        _sync_jobs_with_disk()
+
+    def start_backup_scheduler() -> None:
+        """
+        Start the scheduler and restore any saved schedule from schedule.json.
+        Safe to call multiple times — no-op if already running.
+        Call this once at application startup.
+        """
+        if _scheduler.running:
+            return
+
+        _sync_jobs_with_disk()
 
         _scheduler.start()
         atexit.register(lambda: _scheduler.shutdown(wait=False))
@@ -823,6 +861,9 @@ else:
         raise RuntimeError("APScheduler not installed. Run: pip install apscheduler")
 
     def apply_import_schedule(*_args, **_kwargs) -> None:
+        raise RuntimeError("APScheduler not installed. Run: pip install apscheduler")
+
+    def reload_jobs() -> None:
         raise RuntimeError("APScheduler not installed. Run: pip install apscheduler")
 
     def start_backup_scheduler() -> None:

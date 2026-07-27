@@ -9,8 +9,8 @@ that iot-worker is its own container, api_downlink.py calls the HTTP endpoints
 below instead (X-Internal-Token, same pattern as docker-ops-sidecar/backup-worker).
 
 On startup: initializes the KeyRotationManager, then starts the device
-scheduler and MQTT event listener as daemon threads — both block forever on
-their own, same as they did in main.py's threads for a host run.
+scheduler and MQTT event listener as daemon threads — both block forever
+on their own.
 """
 
 import logging

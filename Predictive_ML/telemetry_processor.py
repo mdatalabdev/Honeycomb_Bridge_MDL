@@ -1,7 +1,5 @@
 from collections import defaultdict
 import logging
-from collections import defaultdict
-import pandas as pd
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

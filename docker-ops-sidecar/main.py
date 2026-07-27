@@ -48,6 +48,27 @@ with app.app_context():
     print('Password updated')
 """
 
+# Used by the forgot-password flow, where the caller has already been authenticated
+# via a one-time reset token instead of the old password — so no old-password check.
+SUPERSET_PASSWORD_RESET_SCRIPT = """
+from superset import create_app
+from superset.extensions import db, security_manager
+import sys
+
+email = sys.argv[1]
+new_password = sys.argv[2]
+
+app = create_app()
+with app.app_context():
+    user = security_manager.find_user(email=email)
+    if not user:
+        print("USER_NOT_FOUND")
+        sys.exit(1)
+    security_manager.reset_password(user.id, new_password)
+    db.session.commit()
+    print("PASSWORD_UPDATED")
+"""
+
 
 def require_internal_token(x_internal_token: str = Header(default="")):
     if not config.SIDECAR_SHARED_SECRET or x_internal_token != config.SIDECAR_SHARED_SECRET:
@@ -70,6 +91,11 @@ class SupersetUserCreate(BaseModel):
 class SupersetPasswordChange(BaseModel):
     email: str
     old_password: str
+    new_password: str
+
+
+class SupersetPasswordReset(BaseModel):
+    email: str
     new_password: str
 
 
@@ -193,3 +219,24 @@ async def superset_change_password(body: SupersetPasswordChange):
     if "password updated" not in output.lower():
         raise HTTPException(status_code=500, detail="Unexpected output: " + output)
     return {"stdout": output}
+
+
+@app.post("/superset/reset-password", dependencies=[Depends(require_internal_token)])
+async def superset_reset_password(body: SupersetPasswordReset):
+    result = subprocess.run(
+        [
+            "docker", "exec", config.CONTAINER_SUPERSET,
+            "python3", "-c", SUPERSET_PASSWORD_RESET_SCRIPT,
+            body.email, body.new_password,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    stdout = result.stdout.strip()
+    if "PASSWORD_UPDATED" in stdout:
+        return {"stdout": stdout}
+    if "USER_NOT_FOUND" in stdout:
+        raise HTTPException(status_code=404, detail=f"User '{body.email}' not found in Superset.")
+    raise HTTPException(status_code=500, detail=f"Unexpected error: {stdout or result.stderr}")
