@@ -66,12 +66,19 @@ services:
     env_file:
       - .env
       - auth/.env.docker
+      - Timescale_db/.env    # SOURCE_DB_*/TARGET_DB_*/BACKUP_ENCRYPTION_KEY names, users, passwords — see backup-worker below
+    environment:
+      SOURCE_DB_HOST: magistrala-timescale   # magistrala/docker/addons/timescale-writer, port 5432 internal (5433 is host-mapped)
+      SOURCE_DB_PORT: "5432"
+      TARGET_DB_HOST: timescaledb            # defined below, port 5432 internal (5436 is host-mapped)
+      TARGET_DB_PORT: "5432"
     ports:
       - "4567:4567"
     depends_on:
       - redis
       - docker-ops-sidecar
       - auth-db
+      - timescaledb
       - iot-worker
       - ml-service
     volumes:
