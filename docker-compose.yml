@@ -189,6 +189,8 @@ services:
     networks:
       - honeycomb-net
       - magistrala-base-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # BASE_URL/USERS_SERVICE_URL point here (Magistrala runs on the host)
     restart: unless-stopped
 
   ml-service:
