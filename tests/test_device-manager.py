@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch, MagicMock
 import grpc
 import logging
 from chirpstack_api import api
-from device_manager import DeviceManager  
+from iot_worker.device_manager import DeviceManager
 
 @pytest.fixture
 def mock_device_manager():

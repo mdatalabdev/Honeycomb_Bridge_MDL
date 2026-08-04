@@ -4,7 +4,7 @@ from chirpstack_api import api
 import grpc
 import logging
 import config
-from application_fetcher import ApplicationFetcher  
+from iot_worker.application_fetcher import ApplicationFetcher
 
 # Setup logging for tests
 logger = logging.getLogger(__name__)

@@ -1,0 +1,211 @@
+# Honeycomb Bridge — see CONTAINERIZATION.md for the full container map.
+# All 9 containers from the map are now wired here: `api`, `docker-ops-sidecar`,
+# `redis`, `auth-db`, `timescaledb`, `backup-worker`, `notifications-worker`,
+# `iot-worker`, and `ml-service`.
+#
+# ChirpStack and EdgeX already run as their own Compose stacks
+# (chirpstack-docker/docker-compose.yml, edgex/edgex-go/docker-compose.yml) that
+# both declare a network literally named `magistrala-base-net` — bring one of
+# those stacks up first so the network exists, then this stack joins it as
+# external. `timescaledb` itself used to be its own stack too
+# (Timescale_db/docker-compose.yaml) but has been folded in below; Timescale_db/
+# now only holds the Python backup-worker code, its initdb SQL, and its .env.
+#
+# `api` and `backup-worker` share a bind mount of ./Timescale_db: api_downlink.py's
+# schedule endpoints and backup_scheduler.py both read/write the same JSON state
+# files there (schedule.json, *_history.json, etc.) — as two separate containers
+# they no longer share the one in-memory APScheduler a single process gave them.
+# api_downlink.py now calls POST http://backup-worker:8091/reload (X-Internal-Token:
+# BACKUP_WORKER_SHARED_SECRET, same pattern as docker-ops-sidecar) right after
+# writing or deleting a schedule file, so backup-worker re-syncs its jobs
+# immediately instead of only on its next restart.
+#
+# `api`, `iot-worker`, and `notifications-worker` share a bind mount of
+# ./edgex_users.json: iot_worker/User_token.py now maintains that file (admin +
+# user EdgeX tokens, moved here with the rest of iot_worker/) and
+# notifications-worker's admin_JWT_token_generator() only reads the admin
+# entry from it — same live-file-sharing reasoning as ./Timescale_db above.
+# This loop used to run as a thread api_downlink.py started on its own FastAPI
+# startup event; that's been removed from api_downlink.py in favor of the
+# notifications-worker container.
+#
+# `api_downlink.py` used to also reach directly into iot_worker's
+# event_fetcher_parse.key_manager (an in-memory KeyRotationManager) and call
+# User_token.* functions directly for 9 device-command / user-JWT endpoints —
+# that only worked because they shared one process. Now that iot-worker is its
+# own container, api_downlink.py calls its HTTP API instead (X-Internal-Token:
+# IOT_WORKER_SHARED_SECRET, same pattern as docker-ops-sidecar/backup-worker).
+#
+# `api` and `ml-service` share a bind mount of ./data: api_downlink.py's
+# /assets/telemetry endpoint (stays in api — no torch/sklearn/xgboost needed)
+# writes training CSVs to data/training_datasets/, and ml-service's /train reads
+# that path back from the request body — same live-file-sharing reasoning as
+# ./Timescale_db and ./edgex_users.json above. Of the 25 predictive_ML routes,
+# only 6 actually need torch/sklearn/xgboost (TrainService, predict/
+# predict_specific, load_model — which always unpickles, even for a
+# metadata-only read) — those moved to ml-service; the other 19 stay in
+# api_downlink.py since they only touch Redis directly, which both containers
+# reach independently (no proxying needed for those). ml-service is kept off
+# api's image on purpose — torch/xgboost/scikit-learn/CUDA are 5-8GB+
+# (Predictive_ML/requirements.txt, layered on top of the slim root one).
+#
+# Magistrala's main gateway/user-service and Superset are not in any Compose stack
+# this repo has visibility into — they're reached via host.docker.internal, i.e.
+# assumed to be running directly on the host. Update BASE_URL / USERS_SERVICE_URL /
+# SUPERSET_BASE_URL in .env if that's not the case in your environment.
+
+networks:
+  honeycomb-net:
+    driver: bridge
+  magistrala-base-net:
+    external: true
+
+services:
+  api:
+    build: .
+    env_file:
+      - .env
+      - auth/.env.docker
+      - Timescale_db/.env    # SOURCE_DB_*/TARGET_DB_*/BACKUP_ENCRYPTION_KEY names, users, passwords — see backup-worker below
+    environment:
+      SOURCE_DB_HOST: magistrala-timescale   # magistrala/docker/addons/timescale-writer, port 5432 internal (5433 is host-mapped)
+      SOURCE_DB_PORT: "5432"
+      TARGET_DB_HOST: timescaledb            # defined below, port 5432 internal (5436 is host-mapped)
+      TARGET_DB_PORT: "5432"
+    ports:
+      - "4567:4567"
+    depends_on:
+      - redis
+      - docker-ops-sidecar
+      - auth-db
+      - timescaledb
+      - iot-worker
+      - ml-service
+    volumes:
+      - ./Timescale_db:/app/Timescale_db
+      - ./edgex_users.json:/app/edgex_users.json
+      - ./data:/app/data
+    networks:
+      - honeycomb-net
+      - magistrala-base-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  docker-ops-sidecar:
+    build: ./docker-ops-sidecar
+    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - honeycomb-net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--port", "6389"]
+    networks:
+      - honeycomb-net
+    restart: unless-stopped
+
+  auth-db:
+    image: postgres:15
+    command: ["-p", "5435"]
+    env_file: auth/.env.docker
+    volumes:
+      - auth-db-data:/var/lib/postgresql/data
+    networks:
+      - honeycomb-net
+    restart: unless-stopped
+
+  timescaledb:
+    image: timescale/timescaledb:2.14.2-pg15
+    container_name: timescaledb
+    environment:
+      POSTGRES_DB: timeseries_db
+      POSTGRES_USER: ts_user
+      POSTGRES_PASSWORD: ts_password
+    ports:
+      - "5436:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./Timescale_db/initdb:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ts_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - honeycomb-net
+      - magistrala-base-net
+    restart: unless-stopped
+
+  backup-worker:
+    build:
+      context: .
+      dockerfile: Timescale_db/Dockerfile
+    env_file:
+      - .env                # BACKUP_WORKER_SHARED_SECRET for the /reload endpoint
+      - auth/.env.docker     # DATABASE_URL — used to look up login_alert_email for failure alerts
+      - Timescale_db/.env    # SOURCE_DB_*/TARGET_DB_*/BACKUP_ENCRYPTION_KEY names, users, passwords
+    environment:
+      SOURCE_DB_HOST: magistrala-timescale   # magistrala/docker/addons/timescale-writer, port 5432 internal (5433 is host-mapped)
+      SOURCE_DB_PORT: "5432"
+      TARGET_DB_HOST: timescaledb            # defined above, port 5432 internal (5436 is host-mapped)
+      TARGET_DB_PORT: "5432"
+    volumes:
+      - ./Timescale_db:/app/Timescale_db
+    depends_on:
+      - auth-db
+      - timescaledb
+    networks:
+      - honeycomb-net
+      - magistrala-base-net
+    restart: unless-stopped
+
+  notifications-worker:
+    build:
+      context: .
+      dockerfile: Notifications/Dockerfile
+    env_file:
+      - .env                # EDGEX_VAULT_BASE_URL, EDGEX_NOTIFICATION_BASE_URL
+      - auth/.env.docker     # DATABASE_URL — notifications table lives in auth-db
+    volumes:
+      - ./edgex_users.json:/app/edgex_users.json
+    depends_on:
+      - auth-db
+    networks:
+      - honeycomb-net
+      - magistrala-base-net
+    restart: unless-stopped
+
+  iot-worker:
+    build:
+      context: .
+      dockerfile: iot_worker/Dockerfile
+    env_file: .env   # CHIRPSTACK_HOST/HTTP_BASE_URL/API_TOKEN, MQTT_BROKER_HOST, EDGEX_VAULT_BASE_URL, IOT_WORKER_SHARED_SECRET
+    volumes:
+      - ./edgex_users.json:/app/edgex_users.json
+    networks:
+      - honeycomb-net
+      - magistrala-base-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # BASE_URL/USERS_SERVICE_URL point here (Magistrala runs on the host)
+    restart: unless-stopped
+
+  ml-service:
+    build:
+      context: .
+      dockerfile: Predictive_ML/Dockerfile
+    env_file: .env   # REDIS_HOST/PORT, BASE_URL/USERS_SERVICE_URL (via User_fetcher), ML_SERVICE_SHARED_SECRET
+    volumes:
+      - ./data:/app/data
+    networks:
+      - honeycomb-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  auth-db-data:
+  timescale_data:

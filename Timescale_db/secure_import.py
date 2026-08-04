@@ -17,10 +17,15 @@ import gzip
 import io
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 
 from psycopg2.extras import execute_batch
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from db_config import get_source_conn, get_target_conn
 from transfer_utils import decrypt, load_key, sftp_connect, sha256_hex

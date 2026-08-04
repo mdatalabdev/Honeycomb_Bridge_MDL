@@ -2,8 +2,6 @@ from fastapi import FastAPI, HTTPException, Query, status, Path, Request, Depend
 from fastapi.responses import JSONResponse
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
-import event_fetcher_parse as efp
-import User_token
 from SMTP_init import LoginAlertMailer
 from pydantic import BaseModel, Field, field_validator, EmailStr
 from pydantic import FieldValidationInfo
@@ -17,13 +15,11 @@ from forgot_password import generate_reset_token, verify_reset_token
 from typing import Optional
 from Predictive_ML import fetch_assets_telemetry
 from Predictive_ML import telemetry_processor
-from fastapi import BackgroundTasks, HTTPException, Depends
+from fastapi import HTTPException, Depends
 from Predictive_ML.training_dataset_csv_creation import (
     create_training_dataset_csv
 )
-from Predictive_ML.ml.train_service import TrainService
-from Predictive_ML.ml.model_store import load_model, delete_model as stored_delete_model, list_models as stored_list_models 
-from Predictive_ML.ml.prediction import predict, predict_specific
+from Predictive_ML.ml.model_store import delete_model as stored_delete_model, list_models as stored_list_models
 from typing import List
 import pyotp
 import qrcode
@@ -39,10 +35,8 @@ import re
 import uuid
 import threading
 import asyncio
-import torch
 from fastapi import Query
 from fastapi.encoders import jsonable_encoder
-from Notifications.worker import run_notification_worker
 from Notifications.db_notification.models import Notification, NotificationAction
 from Notifications.schema import CloseNotificationRequest, NotificationResponse
 from Notifications.db_notification.crud import get_notifications, get_last_notification_timestamp, close_notification, get_notifications_by_status
@@ -56,10 +50,10 @@ import psycopg2
 from fastapi import FastAPI, HTTPException, Query, status
 from psycopg2.extras import execute_batch
 
-from db_config import get_source_conn, get_target_conn
+from Timescale_db.db_config import get_source_conn, get_target_conn
 from Timescale_db.secure_export import secure_export
 from Timescale_db.secure_import import COLUMNS, secure_import, find_latest_export
-from transfer_utils import decrypt, encrypt, load_key, sftp_connect, sha256_hex
+from Timescale_db.transfer_utils import decrypt, encrypt, load_key, sftp_connect, sha256_hex
 
 from captcha_utils import (
     encrypt_aes_gcm_downlink_login,
@@ -67,17 +61,18 @@ from captcha_utils import (
     generate_captcha_text,
     encrypt_aes_gcm,
     decrypt_aes_gcm,
-    decrypt_aes_gcm_downlink_login
+    decrypt_aes_gcm_downlink_login,
+    init_redis,
+    close_redis,
 )
 
-from backup_scheduler import (
+from Timescale_db.backup_scheduler import (
     _AVAILABLE as _SCHEDULER_AVAILABLE,
     _scheduler,
     apply_schedule as _apply_schedule,
     apply_nas_schedule as _apply_nas_schedule,
     apply_restore_schedule as _apply_restore_schedule,
     apply_import_schedule as _apply_import_schedule,
-    start_backup_scheduler,
     SCHEDULE_FILE,
     NAS_SCHEDULE_FILE,
     RESTORE_SCHEDULE_FILE,
@@ -91,7 +86,6 @@ from backup_scheduler import (
 )
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-SYNC_SCRIPT = os.path.join(_HERE, "Timescale_db", "sync.py")
 NAS_CONFIG_FILE = os.path.join(_HERE, "Timescale_db", "nas_config.json")
 _history_lock = threading.Lock()
 _HISTORY_MAX = 1000
@@ -105,26 +99,19 @@ app = FastAPI(
     #redoc_url=None,     # Disables ReDoc (/redoc)
     #openapi_url=None    # Disables OpenAPI schema (/openapi.json)
 )
-CONFIG_FILE = "config-api.json"
-JSON_FILE = "edgex_users.json"
-SUPERSET_CONTAINER = "superset_app"
-
-# Woker thread to pull notifications from edgex and store in DB
-worker_started = False
 
 
 @app.on_event("startup")
-def start_worker():
-    global worker_started
+async def _startup_redis_check():
+    """Verify Redis connectivity at boot — used to run in main.py's host-run thread."""
+    await init_redis()
 
-    if not worker_started:
-        thread = threading.Thread(
-            target=run_notification_worker,
-            args=(5,),
-            daemon=True
-        )
-        thread.start()
-        worker_started = True
+
+@app.on_event("shutdown")
+async def _shutdown_redis():
+    await close_redis()
+CONFIG_FILE = "config-api.json"
+JSON_FILE = "edgex_users.json"
 
 #AUTH_API ------------------------------------------------------------------
 
@@ -465,58 +452,32 @@ def disable_login_alert(current_user = Depends(auth.get_current_user), db: Sessi
 # reset password by email link
 
 def forgot_password_superset(email: EmailStr, new_password: str):
-
-    # Superset password reset Python script executed inside container
-    superset_password_change_script = """
-from superset import create_app
-from superset.extensions import db, security_manager
-import sys
-
-email = sys.argv[1]
-new_password = sys.argv[2]
-
-app = create_app()
-with app.app_context():
-    user = security_manager.find_user(email=email)
-    if not user:
-        print("USER_NOT_FOUND")
-        sys.exit(1)
-
-    security_manager.reset_password(user.id, new_password)
-    db.session.commit()
-    print("PASSWORD_UPDATED")
-"""
-
-    # Execute inside superset_app container
-    result = subprocess.run(
-        [
-            "docker", "exec", "superset_app",
-            "python3", "-c", superset_password_change_script,
-            email, new_password
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    stdout = result.stdout.strip()
-
-    if "PASSWORD_UPDATED" in stdout:
-        return {
-            "status": "success",
-            "message": f"Password updated for '{email}'."
-        }
-
-    if "USER_NOT_FOUND" in stdout:
+    """Force-reset a user's Superset password with no old-password check — the caller
+    has already been authenticated via a one-time reset token (verify_reset_token),
+    not the old password itself. Goes through docker-ops-sidecar, the only container
+    that mounts /var/run/docker.sock (see CONTAINERIZATION.md item 2) — api has no
+    docker socket, so a direct `docker exec` here would fail at runtime.
+    """
+    try:
+        resp = requests.post(
+            f"{config.DOCKER_OPS_SIDECAR_URL}/superset/reset-password",
+            json={"email": email, "new_password": new_password},
+            headers=SIDECAR_HEADERS,
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
         raise HTTPException(
-            status_code=404,
-            detail=f"User '{email}' not found in Superset."
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"docker-ops-sidecar unreachable: {e}"
         )
 
-    raise HTTPException(
-        status_code=500,
-        detail=f"Unexpected error: {stdout or result.stderr}"
-    )
+    if resp.status_code != 200:
+        _sidecar_error_to_http(resp)
+
+    return {
+        "status": "success",
+        "message": f"Password updated for '{email}'."
+    }
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr   # account email (primary login email)
 
@@ -840,7 +801,7 @@ def get_honeycomb_user_list( auth: str = Depends(auth.validate_token)):
    """Returns the list of user after runing update_user_list() function."""
    try:
         # Call the function to update the user list
-        User_token.update_user_list()
+        _iot_worker_post("/users/update-list")
         
         # Read the updated JSON file
         if os.path.exists(JSON_FILE):
@@ -859,7 +820,7 @@ def jwt_rotation( auth: str = Depends(auth.validate_token)):
     Endpoint to trigger JWT rotation for all users.
     """
     try:
-        User_token.Jwt_rotaion_all()
+        _iot_worker_post("/users/rotate-jwt")
         return {
             "status": "success",
             "message": "JWT rotation completed successfully."
@@ -876,18 +837,12 @@ async def resetkeyrotation(data: dict, auth: str = Depends(auth.validate_token))
     Endpoint to send downlink data for resetting key rotation.
     """
     try:
-        if efp.key_manager:
-            efp.key_manager.rotate_keys()
-            return {
-                "status": "success",
-                "message": "Key rotation triggered successfully",
-                "data": data
-            }
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
-                detail="KeyRotationManager not initialized"
-            )
+        _iot_worker_post("/key-rotation/rotate")
+        return {
+            "status": "success",
+            "message": "Key rotation triggered successfully",
+            "data": data
+        }
 
     except ValueError as ve:
         raise HTTPException(
@@ -959,15 +914,7 @@ async def update_frequency(update_frequency: int, dev_euid: str, auth: str = Dep
             raise ValueError("Invalid update frequency value. It must be greater than 1.")
         logger.info(f"update_frequency,{update_frequency}")
 
-        # Check if efp.key_manager exists and has the method
-        if hasattr(efp, "key_manager") and hasattr(efp.key_manager, "send_update_frequency"):
-            efp.key_manager.send_update_frequency(dev_euid, update_frequency)
-        else:
-            logger.error("Key manager is not available or method is missing.")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Key manager service is unavailable."
-            )
+        _iot_worker_post(f"/devices/{dev_euid}/update-frequency", params={"update_frequency": update_frequency})
 
         # Save configuration
         save_update_config(update_frequency, dev_euid)
@@ -1020,18 +967,12 @@ async def device_reboot(dev_euid: str, auth: str = Depends(auth.validate_token))
     """
     try:
         # software reboot
-        if efp.key_manager:
-            efp.key_manager.send_reboot_command(dev_euid)
-            return {
-                "status": "success",
-                "message": "Device reboot command sent successfully",
-                "dev_euid": dev_euid
-            }
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="KeyRotationManager not initialized"
-            )
+        _iot_worker_post(f"/devices/{dev_euid}/reboot")
+        return {
+            "status": "success",
+            "message": "Device reboot command sent successfully",
+            "dev_euid": dev_euid
+        }
 
     except ValueError as ve:
         raise HTTPException(
@@ -1056,18 +997,12 @@ async def device_status(dev_euid: str, auth: str = Depends(auth.validate_token))
     """
     try:
         # current status of the connected device
-        if efp.key_manager:
-            efp.key_manager.send_device_status(dev_euid)
-            return {
-                "status": "success",
-                "message": "Device status command sent successfully",
-                "dev_euid": dev_euid
-            }
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="KeyRotationManager not initialized"
-            )
+        _iot_worker_post(f"/devices/{dev_euid}/status")
+        return {
+            "status": "success",
+            "message": "Device status command sent successfully",
+            "dev_euid": dev_euid
+        }
 
     except ValueError as ve:
         raise HTTPException(
@@ -1095,20 +1030,14 @@ async def log_level(dev_euid: str,level: int, auth: str = Depends(auth.validate_
         if level > 4 :
             raise ValueError("Invalid log level. It must be between 0 and 4.")
         
-        if efp.key_manager:
-            efp.key_manager.set_log_level(dev_euid, level)
-            return {
-                "status": "success",
-                "message": "Log level set successfully",
-                "dev_euid": dev_euid,
-                "level": level
-            }
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="KeyRotationManager not initialized"
-            )
-        
+        _iot_worker_post(f"/devices/{dev_euid}/log-level", params={"level": level})
+        return {
+            "status": "success",
+            "message": "Log level set successfully",
+            "dev_euid": dev_euid,
+            "level": level
+        }
+
     except ValueError as ve:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1132,18 +1061,12 @@ async def time_sync(dev_euid: str, auth: str = Depends(auth.validate_token)):
     """
     try:
         # Time synchronization
-        if efp.key_manager:
-            efp.key_manager.send_time_sync(dev_euid)
-            return {
-                "status": "success",
-                "message": "Time sync command sent successfully",
-                "dev_euid": dev_euid
-            }
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="KeyRotationManager not initialized"
-            )
+        _iot_worker_post(f"/devices/{dev_euid}/time-sync")
+        return {
+            "status": "success",
+            "message": "Time sync command sent successfully",
+            "dev_euid": dev_euid
+        }
 
     except ValueError as ve:
         raise HTTPException(
@@ -1168,18 +1091,12 @@ async def reset_device(dev_euid: str, auth: str = Depends(auth.validate_token)):
     """
     try:
         # Reset device
-        if efp.key_manager:
-            efp.key_manager.send_reset_factory(dev_euid)
-            return {
-                "status": "success",
-                "message": "Device reset command sent successfully-factory reset",
-                "dev_euid": dev_euid
-            }
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="KeyRotationManager not initialized"
-            )
+        _iot_worker_post(f"/devices/{dev_euid}/reset-factory")
+        return {
+            "status": "success",
+            "message": "Device reset command sent successfully-factory reset",
+            "dev_euid": dev_euid
+        }
 
     except ValueError as ve:
         raise HTTPException(
@@ -1197,15 +1114,102 @@ async def reset_device(dev_euid: str, auth: str = Depends(auth.validate_token)):
             detail="Internal Server Error: " + str(e)
         )
     
-# Mapping container roles to their Docker names
-CONTAINERS = {
-    "edgex": config.CONTAINER_EDGEX_SECURITY_PROXY,     # Used for EdgeX user/password management
-    "chirpstack": config.CONTAINER_CHIRPSTACK,            # ChirpStack container for CLI operations
-    "root": config.CONTAINER_VAULT          # Container that holds the Vault token config
-}
+# These operations used to `docker exec` directly into sibling containers, which
+# requires mounting /var/run/docker.sock into this container. Instead they call
+# docker-ops-sidecar, the one container that holds that socket — see
+# CONTAINERIZATION.md item 2.
+SIDECAR_HEADERS = {"X-Internal-Token": config.SIDECAR_SHARED_SECRET}
 
-# Path to the Vault response JSON file inside the container
-ROOT_FILE_PATH = config.VAULT_ROOT_PATH
+# backup-worker no longer shares this process's in-memory APScheduler once
+# containerized separately (see docker-compose.yml's note) — tell it to
+# re-sync jobs with the schedule JSON files right after writing/deleting one.
+# Best-effort: a schedule/restore/import write already succeeded by the time
+# this runs, so a reachability failure here is logged, not raised — the change
+# just won't take effect until backup-worker's next restart, per that note.
+BACKUP_WORKER_HEADERS = {"X-Internal-Token": config.BACKUP_WORKER_SHARED_SECRET}
+
+
+def _notify_backup_worker_reload() -> None:
+    try:
+        requests.post(
+            f"{config.BACKUP_WORKER_URL}/reload",
+            headers=BACKUP_WORKER_HEADERS,
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Could not notify backup-worker to reload: {e}")
+
+
+def _next_run_from_job(job) -> Optional[str]:
+    """next_run for a Job on this process's own _scheduler, whose scheduler.state is
+    always STATE_STOPPED here (see _schedule_exists_and_next_run). Because of that,
+    add_job() always takes BaseScheduler's "tentative" path (queues into _pending_jobs
+    instead of calling _real_add_job), so the returned Job's next_run_time slot is
+    never assigned — reading job.next_run_time raises AttributeError rather than being
+    merely absent. Compute next_run straight from the trigger instead, which needs no
+    job store or running scheduler.
+    """
+    if not job:
+        return None
+    next_fire = job.trigger.get_next_fire_time(None, datetime.now(job.trigger.timezone))
+    return next_fire.isoformat() if next_fire else None
+
+
+def _schedule_exists_and_next_run(job_id: str, schedule_file: str):
+    """Whether a schedule is currently active — based on the persisted JSON file, the
+    real source of truth backup-worker reads on /reload, not this process's own
+    _scheduler. _scheduler is only ever add_job()'d here for CronTrigger validation and
+    a same-request next_run preview — start_backup_scheduler() (the call that would
+    actually .start() it) runs only inside the backup-worker container, so this
+    instance is empty on every fresh `api` process/replica even when a schedule
+    already exists on disk.
+    """
+    exists = os.path.exists(schedule_file)
+    job = _scheduler.get_job(job_id)
+    next_run = _next_run_from_job(job)
+    return exists, next_run
+
+
+def _sidecar_error_to_http(resp: requests.Response) -> None:
+    try:
+        detail = resp.json().get("detail", resp.text)
+    except ValueError:
+        detail = resp.text
+    raise HTTPException(status_code=resp.status_code, detail=detail)
+
+# Device-command and user/JWT-rotation endpoints used to reach directly into
+# iot_worker's event_fetcher_parse.key_manager (an in-memory KeyRotationManager)
+# and User_token.* functions — that only worked because api and iot-worker's
+# background threads shared one process (see docker-compose.yml's note). Now
+# HTTP calls to iot-worker, same pattern as docker-ops-sidecar above.
+IOT_WORKER_HEADERS = {"X-Internal-Token": config.IOT_WORKER_SHARED_SECRET}
+
+
+def _iot_worker_post(path: str, **kwargs) -> requests.Response:
+    try:
+        resp = requests.post(f"{config.IOT_WORKER_URL}{path}", headers=IOT_WORKER_HEADERS, timeout=15, **kwargs)
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"iot-worker unreachable: {e}")
+    if resp.status_code != 200:
+        _sidecar_error_to_http(resp)
+    return resp
+
+# Of the 25 /downlink/predictive_ML/* routes, only the 6 that need
+# torch/sklearn/xgboost (TrainService, predict/predict_specific, load_model —
+# which always unpickles) live in ml-service now; the other 19 stay right here
+# since they only touch Redis directly (both containers reach the same Redis,
+# no proxying needed for those). Same X-Internal-Token pattern as iot-worker above.
+ML_SERVICE_HEADERS = {"X-Internal-Token": config.ML_SERVICE_SHARED_SECRET}
+
+
+def _ml_service_request(method: str, path: str, **kwargs) -> dict:
+    try:
+        resp = requests.request(method, f"{config.ML_SERVICE_URL}{path}", headers=ML_SERVICE_HEADERS, timeout=30, **kwargs)
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"ml-service unreachable: {e}")
+    if resp.status_code != 200:
+        _sidecar_error_to_http(resp)
+    return resp.json()
 
 # === FastAPI Endpoints ===
 
@@ -1238,98 +1242,61 @@ async def generate_password(user_req: UserRequest, auth: str = Depends(auth.vali
     validate_username(username)
 
     try:
-
-        # Secure, parameterized Docker command
-        cmd = [
-            "docker", "exec", CONTAINERS["edgex"],
-            "./secrets-config", "proxy", "adduser",
-            "--user", username,
-            "--tokenTTL", "3650d",
-            "--jwtTTL", "1d",
-            "--useRootToken"
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        output = result.stdout.strip()
-
-        parsed_output = json.loads(output)
-
-        return {
-            "status": "success",
-            "message": "User password generated successfully",
-            "password": parsed_output.get("password", "No password found")
-        }
-
-    except json.JSONDecodeError as je:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Failed to parse Docker output: {output}"
+        resp = requests.post(
+            f"{config.DOCKER_OPS_SIDECAR_URL}/edgex/adduser",
+            json={"username": username},
+            headers=SIDECAR_HEADERS,
+            timeout=15,
         )
-        
-    except subprocess.CalledProcessError as cpe:
+    except requests.exceptions.RequestException as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Docker command failed: {cpe}"
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"docker-ops-sidecar unreachable: {e}"
         )
-    except PermissionError as pe:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(pe)
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal Server Error: " + str(e)
-        )
+
+    if resp.status_code != 200:
+        _sidecar_error_to_http(resp)
+
+    return {
+        "status": "success",
+        "message": "User password generated successfully",
+        "password": resp.json().get("password", "No password found")
+    }
 
 @app.post("/downlink/create-chirpstack-api-key/{name}", summary="Create ChirpStack API Key", description="Creates an API key in ChirpStack.")
 async def create_api_key(name: str = Path(..., min_length=1, description="API key name"), auth: str = Depends(auth.validate_token)):
     """
     Uses the ChirpStack CLI inside the container to generate an API key.
     """
+    # Validate API key name format
+    if not name.strip() or name == ":name" or not re.match(r'^[a-zA-Z0-9_\-]+$', name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or missing 'name' parameter"
+        )
+
+    logging.info(f"Creating ChirpStack API key for: {name}")
+
     try:
-        # Validate API key name format
-        if not name.strip() or name == ":name" or not re.match(r'^[a-zA-Z0-9_\-]+$', name):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid or missing 'name' parameter"
-            )
-
-        logging.info(f"Creating ChirpStack API key for: {name}")
-
-        # Parameterized Docker command (safe)
-        cmd = [
-            "docker", "exec",
-            CONTAINERS["chirpstack"],
-            "chirpstack",
-            "--config", "/etc/chirpstack",
-            "create-api-key",
-            "--name", name
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        output = result.stdout.strip()
-
-        # Extract the token from command output
-        match = re.search(r'token: (\S+)', output)
-        token = match.group(1) if match else "No API key found"
-
-        return {
-            "status": "success",
-            "message": "API key created successfully",
-            "api_key": token
-        }
-
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create API key: {e.stderr.strip()}"
+        resp = requests.post(
+            f"{config.DOCKER_OPS_SIDECAR_URL}/chirpstack/create-api-key/{name}",
+            headers=SIDECAR_HEADERS,
+            timeout=15,
         )
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal Server Error: " + str(e)
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"docker-ops-sidecar unreachable: {e}"
         )
+
+    if resp.status_code != 200:
+        _sidecar_error_to_http(resp)
+
+    return {
+        "status": "success",
+        "message": "API key created successfully",
+        "api_key": resp.json().get("api_key", "No API key found")
+    }
 
 @app.get("/downlink/tokens", summary="Get Root Token", description="Extracts the last root token and returns it as JSON.")
 def get_tokens( auth: str = Depends(auth.validate_token)):
@@ -1337,53 +1304,27 @@ def get_tokens( auth: str = Depends(auth.validate_token)):
     Reads the root token from the Vault response JSON file inside the container.
     """
     try:
-
-        # Parameterized docker exec command as list
-        cmd = ["docker", "exec", CONTAINERS["root"], "cat", ROOT_FILE_PATH]
-
-        output = subprocess.check_output(cmd, text=True).strip()
-
-        parsed_output = json.loads(output)
-        root_token = parsed_output.get("root_token")
-        if not root_token:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Root token not found in the JSON file."
-            )
-
-        return {
-            "status": "success",
-            "message": "Root token retrieved successfully",
-            "root_token": root_token
-        }
-
-    except json.JSONDecodeError as je:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Failed to parse JSON from Vault response."
+        resp = requests.get(
+            f"{config.DOCKER_OPS_SIDECAR_URL}/vault/root-token",
+            headers=SIDECAR_HEADERS,
+            timeout=15,
         )
-    except subprocess.CalledProcessError as cpe:
+    except requests.exceptions.RequestException as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Docker command failed: {cpe}"
-        )
-    except PermissionError as pe:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(pe)
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal Server Error: " + str(e)
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"docker-ops-sidecar unreachable: {e}"
         )
 
-''' This section is for creating a new user in Apache Superset using Docker exec.
-   It uses the Superset CLI to create a user with specified attributes. '''
+    if resp.status_code != 200:
+        _sidecar_error_to_http(resp)
 
-class ConflictError(Exception):
-    pass
+    return {
+        "status": "success",
+        "message": "Root token retrieved successfully",
+        "root_token": resp.json().get("root_token")
+    }
 
+''' This section is for creating a new user in Apache Superset, via docker-ops-sidecar. '''
 
 class UserCreate(BaseModel):
     username: str = Field(..., example="string")
@@ -1469,67 +1410,41 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.post("/downlink/create_superset_user", status_code=status.HTTP_200_OK)
 async def create_superset_user(user: UserCreate, auth: str = Depends(auth.validate_token)):
+    if not user.username or not user.email or not user.password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username, email, and password are required."
+        )
+
     try:
-        if not user.username or not user.email or not user.password:
-            raise ValueError("Username, email, and password are required.")
-
-        docker_command = [
-            "docker", "exec", SUPERSET_CONTAINER,
-            "superset", "fab", "create-user",
-            "--username", user.username,
-            "--firstname", user.first_name,
-            "--lastname", user.last_name,
-            "--email", user.email,
-            "--password", user.password,
-            "--role", user.role
-        ]
-
-        result = subprocess.run(docker_command, capture_output=True, text=True)
-        stdout = result.stdout.strip().lower()
-        stderr = result.stderr.strip().lower()
-
-        if "no such container" in stderr or "not found" in stderr:
-            raise FileNotFoundError("Superset container or command not found.")
-
-        if "already exists" in stdout or "already exists" in stderr:
-            raise ConflictError(f"User with email '{user.email}' already exists.")
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Docker command failed.\nSTDOUT: {stdout}\nSTDERR: {stderr}"
-            )
-
-        return {
-            "status": "success",
-            "code": 200,
-            "message": f"User '{user.username}' created successfully.",
-            "stdout": result.stdout.strip()
-        }
-
-    except PermissionError as pe:
+        resp = requests.post(
+            f"{config.DOCKER_OPS_SIDECAR_URL}/superset/create-user",
+            json={
+                "username": user.username,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "email": user.email,
+                "password": user.password,
+                "role": user.role,
+            },
+            headers=SIDECAR_HEADERS,
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as e:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(pe)
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"docker-ops-sidecar unreachable: {e}"
         )
 
-    except FileNotFoundError as fnfe:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(fnfe)
-        )
+    if resp.status_code != 200:
+        _sidecar_error_to_http(resp)
 
-    except ConflictError as ce:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(ce)
-        )
-
-    except RuntimeError as re_err:
-        clean_msg = str(re_err).replace('\n', ' ')
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal Server Error: " + clean_msg
-        )
+    return {
+        "status": "success",
+        "code": 200,
+        "message": f"User '{user.username}' created successfully.",
+        "stdout": resp.json().get("stdout", "")
+    }
 
 
 class PasswordChangeRequest(BaseModel):
@@ -1592,67 +1507,35 @@ async def change_password(body: PasswordChangeRequest, auth: str = Depends(auth.
                         detail=f"Password cannot contain parts of your email address: '{part}'"
                     )
 
-    # 5. Docker command to change Superset user password
-    superset_password_change_script = """
-from superset import create_app
-from superset.extensions import db, security_manager
-from werkzeug.security import check_password_hash
-import sys
-
-email = sys.argv[1]
-old_password = sys.argv[2]
-new_password = sys.argv[3]
-
-app = create_app()
-with app.app_context():
-    user = security_manager.find_user(email=email)
-    if not user or not check_password_hash(user.password, old_password):
-        print('Old password is incorrect')
-        sys.exit(1)
-    security_manager.reset_password(user.id, new_password)
-    db.session.commit()
-    print('Password updated')
-"""
-
+    # 5. Change the Superset user password via docker-ops-sidecar (see
+    #    CONTAINERIZATION.md item 2 — the script that runs inside the superset
+    #    container now lives in docker-ops-sidecar/main.py)
     try:
-        result = subprocess.run(
-            [
-                "docker", "exec", SUPERSET_CONTAINER,
-                "python3", "-c", superset_password_change_script,
-                body.email, body.old_password, body.new_password
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+        resp = requests.post(
+            f"{config.DOCKER_OPS_SIDECAR_URL}/superset/change-password",
+            json={
+                "email": body.email,
+                "old_password": body.old_password,
+                "new_password": body.new_password,
+            },
+            headers=SIDECAR_HEADERS,
+            timeout=15,
         )
-    except subprocess.CalledProcessError:
+    except requests.exceptions.RequestException as e:
         raise HTTPException(
-            status_code=404,
-            detail=f"Docker container '{SUPERSET_CONTAINER}' not found or failed to exec command."
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"docker-ops-sidecar unreachable: {e}"
         )
 
-    if result.returncode != 0:
-        if "old password is incorrect" in result.stdout.lower():
-            raise HTTPException(status_code=401, detail="Old password is incorrect.")
-        raise HTTPException(
-            status_code=500,
-            detail="Docker exec error: " + (result.stderr.strip() or result.stdout.strip())
-        )
+    if resp.status_code != 200:
+        _sidecar_error_to_http(resp)
 
-    output = result.stdout.strip()
-
-    if "password updated" in output.lower():
-        return {
-            "status": "success",
-            "code": 200,
-            "message": f"Password updated for '{body.email}'.",
-            "stdout": output
-        }
-
-    raise HTTPException(
-        status_code=500,
-        detail="Unexpected output: " + output
-    )
+    return {
+        "status": "success",
+        "code": 200,
+        "message": f"Password updated for '{body.email}'.",
+        "stdout": resp.json().get("stdout", "")
+    }
 class CaptchaVerifyRequest(BaseModel):
     captcha_id: str
     encrypted_input: dict  # { "iv": ..., "ciphertext": ..., "tag": ... }
@@ -1988,58 +1871,13 @@ def pred_job_key(job_id: str, model_name: str, asset_id: str) -> str:
 @app.post("/downlink/predictive_ML/train")
 async def submit_training_job(
     payload: TrainModelRequest,
-    background_tasks: BackgroundTasks,
     current_user=Depends(auth.get_current_user)
 ):
     existing_models = await stored_list_models()
     if payload.model_name in existing_models:
         raise HTTPException(status_code=400, detail="Model name already exists")
- 
-    job_id = str(uuid.uuid4())
-    key = f"train:{job_id}:{payload.model_name}:{payload.target_column}"
- 
-    await redis_client.set(key, json.dumps({
-        "status": "queued",
-        "model_name": payload.model_name,
-        "target_column": payload.target_column
-    }))
- 
-    async def _run():
-        try:
-            await redis_client.set(key, json.dumps({"status": "running"}))
 
-            window_length = await redis_client.get(f"Window_length:{payload.asset_id}")
-            freq_minutes = int(window_length) / 60 if window_length else 5.0
-
-            train_service = TrainService()
-            result = await train_service.train(
-                csv_path=payload.dataset_path,
-                target_column=payload.target_column,
-                user_model_name=payload.model_name,
-                algorithm=payload.model_type,
-                horizon=payload.horizon,
-                freq_minutes=freq_minutes
-            )
-            await redis_client.set(key, json.dumps({
-                "status": "completed",
-                "model_name": payload.model_name,
-                "target_column": payload.target_column,
-                "metrics": result["metrics"],
-                "metadata": result["metadata"],
-                "sensor_correlation": result["sensor_correlation"],
-                "label_info": result["label_info"]
-            }))
-        except Exception as e:
-            logging.error(f"Training failed: {e}", exc_info=True)
-            await redis_client.set(key, json.dumps({"status": "failed", "error": str(e)}))
- 
-    background_tasks.add_task(_run)
-    return {
-        "status": "accepted",
-        "job_id": job_id,
-        "job_key": key,
-        "message": "Training started in background"
-    }
+    return _ml_service_request("POST", "/train", json=payload.model_dump())
 
 @app.get("/downlink/predictive_ML/status/train/{job_id}")
 async def get_train_status(job_id: str, current_user=Depends(auth.get_current_user)):
@@ -2068,17 +1906,7 @@ async def get_model_metadata(
     model_name: str,
     current_user=Depends(auth.get_current_user)
 ):
-    
-    model, metadata = await load_model(model_name)
-
-    if not model:
-        raise HTTPException(status_code=404, detail="Model not found")
-
-    return {
-        "status": "success",
-        "model_name": model_name,
-        "metadata": metadata
-    }
+    return _ml_service_request("GET", f"/models/{model_name}")
     
 @app.delete("/downlink/predictive_ML/models/{model_name}")
 async def delete_model(
@@ -2104,45 +1932,9 @@ class PredictRequest(BaseModel):
 @app.post("/downlink/predictive_ML/predict", summary="Run prediction using stored ML model")
 async def predict_api(
     payload: PredictRequest,
-    background_tasks: BackgroundTasks,
     current_user=Depends(auth.get_current_user)
 ):
-    job_id = str(uuid.uuid4())
-    key = f"pred:{job_id}:{payload.model_name}:{payload.asset_id}"
- 
-    await redis_client.set(key, json.dumps({
-        "status": "queued",
-        "model_name": payload.model_name,
-        "asset_id": payload.asset_id
-    }))
- 
-    async def _run():
-        try:
-            await redis_client.set(key, json.dumps({"status": "running"}))
-            result = await predict(model_name=payload.model_name, asset_id=payload.asset_id)
-            if result is None:
-                await redis_client.set(key, json.dumps({
-                    "status": "failed",
-                    "error": "No telemetry data found"
-                }))
-                return
-            await redis_client.set(key, json.dumps({
-                "status": "completed",
-                "model_name": payload.model_name,
-                "asset_id": payload.asset_id,
-                "result": result
-            }))
-        except Exception as e:
-            logging.error(f"Predict job failed: {e}", exc_info=True)
-            await redis_client.set(key, json.dumps({"status": "failed", "error": str(e)}))
- 
-    background_tasks.add_task(_run)
-    return {
-        "status": "accepted",
-        "job_id": job_id,
-        "job_key": key,
-        "message": "Prediction started in background"
-    }
+    return _ml_service_request("POST", "/predict", json=payload.model_dump())
 
 @app.get("/downlink/predictive_ML/status/pred/{job_id}")
 async def get_pred_status(job_id: str, current_user=Depends(auth.get_current_user)):
@@ -2374,97 +2166,9 @@ class Assettelemertyfetchandtrainrequest(BaseModel):
 @app.post("/downlink/predictive_ML/Asset_specific/assets/fetch-train", summary="Fetch telemetry, process and train a model")
 async def fetch_train_asset_model(
     payload: Assettelemertyfetchandtrainrequest,
-    background_tasks: BackgroundTasks,
     current_user=Depends(auth.get_current_user)
 ):
-    job_id = str(uuid.uuid4())
-    key = f"train:{job_id}:{payload.model_name}:{payload.target_column}"
- 
-    await redis_client.set(key, json.dumps({
-        "status": "queued",
-        "model_name": payload.model_name,
-        "target_column": payload.target_column
-    }))
- 
-    async def _run():
-        try:
-            await redis_client.set(key, json.dumps({"status": "running"}))
- 
-            telemetry_fetcher = fetch_assets_telemetry.FetchAssetsTelemetry()
-            telemetry_data = telemetry_fetcher.get_telemetry_data_asset(payload.asset_id)
-            if telemetry_data is None:
-                await redis_client.set(key, json.dumps({
-                    "status": "failed",
-                    "error": "Failed to fetch telemetry data"
-                }))
-                return
- 
-            processor = telemetry_processor.TelemetryProcessor(telemetry_data)
-            processed_data = processor.aggregate_window(window_size_sec=payload.window_length)
-            processed_data = telemetry_processor.handle_missing_windows(processed_data)
-            await redis_client.set(f"Window_length:{payload.asset_id}", payload.window_length)
- 
-            sensor_map_json = await redis_client.get(f"sensor_map:{payload.model_name}")
-            if not sensor_map_json:
-                await redis_client.set(key, json.dumps({
-                    "status": "failed",
-                    "error": f"Sensor mapping not found for model: {payload.model_name}"
-                }))
-                return
- 
-            sensor_map = json.loads(sensor_map_json)
- 
-            threshold_map = {}
-            if payload.model_name == "Slipring Induction motor 60kw":
-                sensor_thresholds = {
-                    "Vibration_avg":      {"prefailure": 5.0,  "failure": 7.0},
-                    "Temperature_avg":    {"prefailure": 80.0, "failure": 90.0},
-                    "Stator_Current_avg": {"prefailure": 10.0, "failure": 15.0},
-                    "Rotor_Current_avg":  {"prefailure": 8.0,  "failure": 12.0},
-                }
-                threshold_map = {
-                    sensor_map[k]: v
-                    for k, v in sensor_thresholds.items()
-                    if k in sensor_map
-                }
- 
-            labeled_data = telemetry_processor.label_data(
-                aggregated_data=processed_data,
-                threshold_map=threshold_map
-            )
- 
-            train_service = TrainService()
-            result = await train_service.train_specific_model(
-                labeled_data=labeled_data,
-                target_column=payload.target_column,
-                user_model_name=payload.model_name,
-                algorithm=payload.model_type,
-                horizon=payload.horizon,
-                equipment_type=payload.model_name,
-                thresholds=threshold_map,
-                freq_minutes=payload.window_length / 60,
-            )
- 
-            await redis_client.set(key, json.dumps({
-                "status": "completed",
-                "model_name": payload.model_name,
-                "target_column": payload.target_column,
-                "metrics": result["metrics"],
-                "metadata": result["metadata"],
-                "sensor_correlation": result["sensor_correlation"],
-                "label_info": result["label_info"]
-            }))
-        except Exception as e:
-            logging.error(f"Fetch-train job failed: {e}", exc_info=True)
-            await redis_client.set(key, json.dumps({"status": "failed", "error": str(e)}))
- 
-    background_tasks.add_task(_run)
-    return {
-        "status": "accepted",
-        "job_id": job_id,
-        "job_key": key,
-        "message": "Fetch-train started in background"
-    }
+    return _ml_service_request("POST", "/asset-specific/fetch-train", json=payload.model_dump())
     
     
 class PredictSpecificRequest(BaseModel):
@@ -2474,45 +2178,9 @@ class PredictSpecificRequest(BaseModel):
 @app.post("/downlink/predictive_ML/Asset_specific/predict", summary="Run prediction using an asset-specific model")
 async def predict_specific_asset_model(
     payload: PredictSpecificRequest,
-    background_tasks: BackgroundTasks,
     current_user=Depends(auth.get_current_user)
 ):
-    job_id = str(uuid.uuid4())
-    key = f"pred:{job_id}:{payload.model_name}:{payload.asset_id}"
- 
-    await redis_client.set(key, json.dumps({
-        "status": "queued",
-        "model_name": payload.model_name,
-        "asset_id": payload.asset_id
-    }))
- 
-    async def _run():
-        try:
-            await redis_client.set(key, json.dumps({"status": "running"}))
-            result = await predict_specific(model_name=payload.model_name, asset_id=payload.asset_id)
-            if result is None:
-                await redis_client.set(key, json.dumps({
-                    "status": "failed",
-                    "error": "No telemetry data found"
-                }))
-                return
-            await redis_client.set(key, json.dumps({
-                "status": "completed",
-                "model_name": payload.model_name,
-                "asset_id": payload.asset_id,
-                "result": result
-            }))
-        except Exception as e:
-            logging.error(f"Asset-specific predict job failed: {e}", exc_info=True)
-            await redis_client.set(key, json.dumps({"status": "failed", "error": str(e)}))
- 
-    background_tasks.add_task(_run)
-    return {
-        "status": "accepted",
-        "job_id": job_id,
-        "job_key": key,
-        "message": "Asset-specific prediction started in background"
-    }
+    return _ml_service_request("POST", "/asset-specific/predict", json=payload.model_dump())
    
 ######################################################################
 # List stored job IDs
@@ -3084,6 +2752,10 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
         headers={"Authorization": f"Bearer {edgex_token}"}
     )
     if JWT_responce_edgex.status_code != 200:
+        logging.error(
+            f"Failed to get Edgex JWT for user {edgex_user}: "
+            f"status={JWT_responce_edgex.status_code}, body={JWT_responce_edgex.text}"
+        )
         raise HTTPException(status_code=500, detail="Failed to get Edgex JWT")
     
     edgex_jwt = JWT_responce_edgex.json().get("data", {}).get("token")
@@ -3105,14 +2777,14 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     logging.info(f"First ChirpStack tenant ID: {first_tenant_id}")
     
     # 10. login for superset and get the token
-    
-    superset_username = magistrala_identity
-    superset_password = magistrala_secret
-    
-    # combine {iv,chiphertext and tag into one string with : as separator to send to superset}
-    
-    superset_identity = f"{magistrala_identity['iv']}:{magistrala_identity['ciphertext']}:{magistrala_identity['tag']}"
-    superset_secret = f"{magistrala_secret['iv']}:{magistrala_secret['ciphertext']}:{magistrala_secret['tag']}"
+
+    # Superset accounts are provisioned once with config.encrypted_user/encrypted_pass
+    # (fixed iv/ciphertext/tag) as the username/password — re-encrypting the logged-in
+    # user's own credentials here would produce a different string every call (random
+    # IV per encryption) and could never match what the Superset account was created with.
+
+    superset_identity = f"{config.encrypted_user['iv']}:{config.encrypted_user['ciphertext']}:{config.encrypted_user['tag']}"
+    superset_secret = f"{config.encrypted_pass['iv']}:{config.encrypted_pass['ciphertext']}:{config.encrypted_pass['tag']}"
     
     superset_login_response = requests.post(
         f"{config.SUPERSET_BASE_URL}/api/v1/security/login",
@@ -3123,6 +2795,10 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
             "refresh": True
         })
     if superset_login_response.status_code != 200:
+        logging.error(
+            f"Failed to authenticate with Superset: "
+            f"status={superset_login_response.status_code}, body={superset_login_response.text}"
+        )
         raise HTTPException(status_code=500, detail="Failed to authenticate with Superset")
     
     superset_access_token = superset_login_response.json().get("access_token")
@@ -3213,32 +2889,7 @@ async def honeycomb_mfa_verify(
 # check GPU specifications and availability for LSTM training
 @app.get("/downlink/predictive_ML/lstm/gpu-info", summary="Get GPU information for LSTM training")
 async def get_gpu_info(current_user=Depends(auth.get_current_user)):
-    try:
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            gpu_info = []
-            for i in range(gpu_count):
-                gpu_info.append({
-                    "name": torch.cuda.get_device_name(i),
-                    "total_memory": torch.cuda.get_device_properties(i).total_memory,
-                    "available_memory": torch.cuda.memory_allocated(i),
-                    "free_memory": torch.cuda.memory_reserved(i) - torch.cuda.memory_allocated(i)
-                })
-            return {
-                "status": "success",
-                "gpu_available": True,
-                "gpu_count": gpu_count,
-                "gpu_info": gpu_info
-            }
-        else:
-            return {
-                "status": "success",
-                "gpu_available": False,
-                "message": "No GPU available, training will use CPU which may be slower."
-            }
-    except Exception as e:
-        logging.error(f"Failed to get GPU info: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to get GPU information")
+    return _ml_service_request("GET", "/lstm/gpu-info")
     
 ########################################################################## BACKUP INTEGRATION ##########################################################################
 def _append_history(file_path: str, entry: dict) -> None:
@@ -3300,23 +2951,6 @@ def managed_conn(conn_fn):
     finally:
         cur.close()
         conn.close()
-
-
-def _run_script(command: list[str]) -> str:
-    """Run a Python script and return combined stdout+stderr. Raises on failure."""
-    script = command[1] if len(command) > 1 else command[0]
-    if not os.path.exists(script):
-        raise RuntimeError(f"Script not found: {script}")
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=3600,
-    )
-    output = (result.stdout + result.stderr).strip()
-    if result.returncode != 0:
-        raise RuntimeError(output)
-    return output
 
 
 # ── Pydantic models ─────────────────────────────────────
@@ -3721,8 +3355,8 @@ def set_restore_schedule(req: RestoreScheduleRequest, current_user=Depends(auth.
             detail="APScheduler not installed. Run: pip install apscheduler",
         )
 
-    existing = _scheduler.get_job("daily_restore")
-    if existing:
+    exists, existing_next_run = _schedule_exists_and_next_run("daily_restore", RESTORE_SCHEDULE_FILE)
+    if exists:
         saved = {}
         if os.path.exists(RESTORE_SCHEDULE_FILE):
             try:
@@ -3735,7 +3369,7 @@ def set_restore_schedule(req: RestoreScheduleRequest, current_user=Depends(auth.
             detail={
                 "message": "A restore schedule already exists. DELETE /downlink/guardian/restore/schedule first.",
                 "current_schedule": {k: v for k, v in saved.items() if k != "user_id"},
-                "next_run": existing.next_run_time.isoformat() if existing.next_run_time else None,
+                "next_run": existing_next_run,
             },
         )
 
@@ -3759,9 +3393,10 @@ def set_restore_schedule(req: RestoreScheduleRequest, current_user=Depends(auth.
         _apply_restore_schedule(req.time, req.timezone, req.mode, **kwargs)
         with open(RESTORE_SCHEDULE_FILE, "w") as f:
             json.dump(saved, f, indent=2)
+        _notify_backup_worker_reload()
 
         job = _scheduler.get_job("daily_restore")
-        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+        next_run = _next_run_from_job(job)
 
         return {
             "status": "Scheduled",
@@ -3783,22 +3418,21 @@ def get_restore_schedule(current_user=Depends(auth.get_current_user)):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="APScheduler not installed. Run: pip install apscheduler",
         )
-    job = _scheduler.get_job("daily_restore")
-    if not job:
+    exists, next_run = _schedule_exists_and_next_run("daily_restore", RESTORE_SCHEDULE_FILE)
+    if not exists:
         return {"scheduled": False, "schedule": None, "next_run": None}
 
     schedule_data = None
-    if os.path.exists(RESTORE_SCHEDULE_FILE):
-        try:
-            with open(RESTORE_SCHEDULE_FILE) as f:
-                schedule_data = json.load(f)
-        except Exception:
-            pass
+    try:
+        with open(RESTORE_SCHEDULE_FILE) as f:
+            schedule_data = json.load(f)
+    except Exception:
+        pass
 
     return {
         "scheduled": True,
         "schedule": schedule_data,
-        "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+        "next_run": next_run,
     }
 
 
@@ -3818,6 +3452,7 @@ def delete_restore_schedule(current_user=Depends(auth.get_current_user)):
             os.remove(RESTORE_SCHEDULE_FILE)
         except OSError as e:
             logging.warning(f"Could not remove restore schedule file: {e}")
+    _notify_backup_worker_reload()
     return {"status": "Restore schedule removed"}
 
 
@@ -3964,8 +3599,8 @@ def set_backup_schedule(req: BackupScheduleRequest, current_user=Depends(auth.ge
             detail="APScheduler not installed. Run: pip install apscheduler",
         )
 
-    existing = _scheduler.get_job("daily_backup")
-    if existing:
+    exists, existing_next_run = _schedule_exists_and_next_run("daily_backup", SCHEDULE_FILE)
+    if exists:
         saved = {}
         if os.path.exists(SCHEDULE_FILE):
             try:
@@ -3978,7 +3613,7 @@ def set_backup_schedule(req: BackupScheduleRequest, current_user=Depends(auth.ge
             detail={
                 "message": "A backup schedule already exists. DELETE /downlink/guardian/backup/schedule first.",
                 "current_schedule": {k: v for k, v in saved.items() if k != "user_id"},
-                "next_run": existing.next_run_time.isoformat() if existing.next_run_time else None,
+                "next_run": existing_next_run,
             },
         )
 
@@ -4002,9 +3637,10 @@ def set_backup_schedule(req: BackupScheduleRequest, current_user=Depends(auth.ge
         _apply_schedule(req.time, req.timezone, req.mode, **kwargs)
         with open(SCHEDULE_FILE, "w") as f:
             json.dump(persist, f, indent=2)
+        _notify_backup_worker_reload()
 
         job = _scheduler.get_job("daily_backup")
-        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+        next_run = _next_run_from_job(job)
 
         return {
             "status": "Scheduled",
@@ -4027,8 +3663,8 @@ def get_backup_schedule(current_user=Depends(auth.get_current_user)):
             detail="APScheduler not installed. Run: pip install apscheduler",
         )
 
-    job = _scheduler.get_job("daily_backup")
-    if not job:
+    exists, next_run = _schedule_exists_and_next_run("daily_backup", SCHEDULE_FILE)
+    if not exists:
         return {"scheduled": False, "schedule": None, "next_run": None}
 
     schedule_data = None
@@ -4042,7 +3678,7 @@ def get_backup_schedule(current_user=Depends(auth.get_current_user)):
     return {
         "scheduled": True,
         "schedule": schedule_data,
-        "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+        "next_run": next_run,
     }
 
 
@@ -4063,6 +3699,7 @@ def delete_backup_schedule(current_user=Depends(auth.get_current_user)):
             os.remove(SCHEDULE_FILE)
         except OSError as e:
             logging.warning(f"Could not remove schedule file: {e}")
+    _notify_backup_worker_reload()
     return {"status": "Schedule removed"}
 
 
@@ -4079,8 +3716,8 @@ def set_nas_schedule(req: NasScheduleRequest, current_user=Depends(auth.get_curr
             detail="APScheduler not installed. Run: pip install apscheduler",
         )
 
-    existing = _scheduler.get_job("daily_nas_backup")
-    if existing:
+    exists, existing_next_run = _schedule_exists_and_next_run("daily_nas_backup", NAS_SCHEDULE_FILE)
+    if exists:
         saved = {}
         if os.path.exists(NAS_SCHEDULE_FILE):
             try:
@@ -4093,7 +3730,7 @@ def set_nas_schedule(req: NasScheduleRequest, current_user=Depends(auth.get_curr
             detail={
                 "message": "A NAS backup schedule already exists. DELETE /downlink/guardian/nas-backup/schedule first.",
                 "current_schedule": {k: v for k, v in saved.items() if k not in ("password", "user_id")},
-                "next_run": existing.next_run_time.isoformat() if existing.next_run_time else None,
+                "next_run": existing_next_run,
             },
         )
 
@@ -4139,9 +3776,10 @@ def set_nas_schedule(req: NasScheduleRequest, current_user=Depends(auth.get_curr
         )
         with open(NAS_SCHEDULE_FILE, "w") as f:
             json.dump(persist, f, indent=2)
+        _notify_backup_worker_reload()
 
         job = _scheduler.get_job("daily_nas_backup")
-        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+        next_run = _next_run_from_job(job)
 
         return {
             "status": "Scheduled",
@@ -4165,8 +3803,8 @@ def get_nas_schedule(current_user=Depends(auth.get_current_user)):
             detail="APScheduler not installed. Run: pip install apscheduler",
         )
 
-    job = _scheduler.get_job("daily_nas_backup")
-    if not job:
+    exists, next_run = _schedule_exists_and_next_run("daily_nas_backup", NAS_SCHEDULE_FILE)
+    if not exists:
         return {"scheduled": False, "schedule": None, "next_run": None}
 
     schedule_data = None
@@ -4182,7 +3820,7 @@ def get_nas_schedule(current_user=Depends(auth.get_current_user)):
     return {
         "scheduled": True,
         "schedule": schedule_data,
-        "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+        "next_run": next_run,
     }
 
 
@@ -4203,6 +3841,7 @@ def delete_nas_schedule(current_user=Depends(auth.get_current_user)):
             os.remove(NAS_SCHEDULE_FILE)
         except OSError as e:
             logging.warning(f"Could not remove NAS schedule file: {e}")
+    _notify_backup_worker_reload()
     return {"status": "NAS schedule removed"}
 
 
@@ -4229,10 +3868,8 @@ def sync_status(current_user=Depends(auth.get_current_user)):
         in_sync = difference == 0
 
         next_run = None
-        if _SCHEDULER_AVAILABLE and _scheduler and _scheduler.running:
-            job = _scheduler.get_job("daily_backup")
-            if job and job.next_run_time:
-                next_run = job.next_run_time.isoformat()
+        if _SCHEDULER_AVAILABLE:
+            _exists, next_run = _schedule_exists_and_next_run("daily_backup", SCHEDULE_FILE)
 
         if in_sync:
             message = "Backup is up to date."
@@ -4410,8 +4047,8 @@ def _import_schedule_post(req: ImportScheduleRequest, target: str,
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="APScheduler not installed. Run: pip install apscheduler")
 
-    existing = _scheduler.get_job(job_id)
-    if existing:
+    exists, existing_next_run = _schedule_exists_and_next_run(job_id, schedule_file)
+    if exists:
         saved = {}
         if os.path.exists(schedule_file):
             try:
@@ -4425,7 +4062,7 @@ def _import_schedule_post(req: ImportScheduleRequest, target: str,
                 "message": f"An import schedule for {target} already exists. "
                            f"DELETE /downlink/guardian/secure-import/{target}/schedule first.",
                 "current_schedule": {k: v for k, v in saved.items() if k not in ("password", "user_id")},
-                "next_run": existing.next_run_time.isoformat() if existing.next_run_time else None,
+                "next_run": existing_next_run,
             },
         )
 
@@ -4471,9 +4108,10 @@ def _import_schedule_post(req: ImportScheduleRequest, target: str,
         )
         with open(schedule_file, "w") as f:
             json.dump(persist, f, indent=2)
+        _notify_backup_worker_reload()
 
         job = _scheduler.get_job(job_id)
-        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+        next_run = _next_run_from_job(job)
 
         return {
             "status": "Scheduled",
@@ -4504,7 +4142,7 @@ def get_import_backup_schedule(current_user=Depends(auth.get_current_user)):
     if not _SCHEDULER_AVAILABLE:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="APScheduler not installed.")
-    job = _scheduler.get_job("daily_import_backup")
+    exists, next_run = _schedule_exists_and_next_run("daily_import_backup", IMPORT_BACKUP_SCHEDULE_FILE)
     schedule_data = None
     if os.path.exists(IMPORT_BACKUP_SCHEDULE_FILE):
         try:
@@ -4514,9 +4152,9 @@ def get_import_backup_schedule(current_user=Depends(auth.get_current_user)):
         except Exception:
             pass
     return {
-        "scheduled": bool(job),
+        "scheduled": exists,
         "schedule": schedule_data,
-        "next_run": job.next_run_time.isoformat() if job and job.next_run_time else None,
+        "next_run": next_run,
     }
 
 
@@ -4534,6 +4172,7 @@ def delete_import_backup_schedule(current_user=Depends(auth.get_current_user)):
             os.remove(IMPORT_BACKUP_SCHEDULE_FILE)
         except OSError as e:
             logging.warning(f"Could not remove import backup schedule file: {e}")
+    _notify_backup_worker_reload()
     return {"status": "Import backup schedule removed"}
 
 
@@ -4554,7 +4193,7 @@ def get_import_production_schedule(current_user=Depends(auth.get_current_user)):
     if not _SCHEDULER_AVAILABLE:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="APScheduler not installed.")
-    job = _scheduler.get_job("daily_import_production")
+    exists, next_run = _schedule_exists_and_next_run("daily_import_production", IMPORT_PRODUCTION_SCHEDULE_FILE)
     schedule_data = None
     if os.path.exists(IMPORT_PRODUCTION_SCHEDULE_FILE):
         try:
@@ -4564,9 +4203,9 @@ def get_import_production_schedule(current_user=Depends(auth.get_current_user)):
         except Exception:
             pass
     return {
-        "scheduled": bool(job),
+        "scheduled": exists,
         "schedule": schedule_data,
-        "next_run": job.next_run_time.isoformat() if job and job.next_run_time else None,
+        "next_run": next_run,
     }
 
 
@@ -4584,6 +4223,7 @@ def delete_import_production_schedule(current_user=Depends(auth.get_current_user
             os.remove(IMPORT_PRODUCTION_SCHEDULE_FILE)
         except OSError as e:
             logging.warning(f"Could not remove import production schedule file: {e}")
+    _notify_backup_worker_reload()
     return {"status": "Import production schedule removed"}
 
 
