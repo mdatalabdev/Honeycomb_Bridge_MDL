@@ -1,297 +1,289 @@
-# USER-APPLICATION-HONEYCOMB
+# Honeycomb Bridge
 
 ## 📌 Overview
-USER-APPLICATION-HONEYCOMB is a Python-based application designed to **fetch, manage, and process IoT device data** from **ChirpStack**. The system dynamically updates the device list and decodes incoming sensor data using predefined codecs.  
+
+Honeycomb Bridge is the integration layer that sits between the Honeycomb IoT
+stack (**ChirpStack**, **EdgeX**, **Magistrala**, **Superset**) and the
+Honeycomb frontend. It exposes a single FastAPI surface (`api_downlink.py`)
+for auth/MFA, device commands, notifications, TimescaleDB backup/restore, and
+predictive-ML routes, backed by a set of independently deployable worker
+containers.
+
+What used to be one process (`main.py` running the API plus several
+background threads) is now split across **9 containers** — see
+[Architecture](#-architecture) below and [CONTAINERIZATION.md](CONTAINERIZATION.md)
+for the full rationale behind the split.
 
 ### **🚀 Key Features**
-- **Device Management**: Fetches and maintains a dictionary (`all_devices`) with devices and their codecs.
-- **Event Processing**: Listens to MQTT events from ChirpStack and decodes device payloads.
-- **Automatic Updates**: A scheduler ensures newly added devices are fetched periodically.
-- **Modular Design**: Well-structured code for better maintainability.
-- **Asymmetric Ciphering Support**: Supports **ECDH ciphering** for secure encryption and decryption of device data.
+
+- **Auth & MFA**: user login, TOTP-based MFA, captcha, forgot-password, login-alert emails (`auth/`, `captcha_utils.py`, `forgot_password.py`, `SMTP_init.py`).
+- **IoT Device Management**: ChirpStack device/application/tenant sync, MQTT event decoding, downlink commands, key rotation, EdgeX user/JWT management (`iot_worker/`).
+- **Notifications**: polls EdgeX for notifications, stores them in Postgres, exposes a NEW→CLOSED workflow API (`Notifications/`).
+- **TimescaleDB Backup/Restore**: incremental sync from the Magistrala production DB to TimescaleDB, encrypted NAS export/import, scheduled jobs, sync history (`Timescale_db/`).
+- **Predictive ML**: telemetry-based training dataset generation and model training/inference for sensor data (`Predictive_ML/`).
+- **Docker Ops Sidecar**: the only container with access to the Docker socket; brokers `docker exec` calls into ChirpStack/EdgeX/Superset containers on `api`'s behalf (`docker-ops-sidecar/`).
 
 ---
 
-## **📂 Project Structure**
+## 📂 Project Structure
+
 ```
-USER-APPLICATION-HONEYCOMB/
-🕠 __pycache__/               # Compiled Python files
-🕠 .venv/                     # Virtual environment (if used)
-🕠 old_code/                  # Backup of previous versions
-🕠 .gitignore                 # Git ignore rules
-🕠 application_fetcher.py      # Fetches applications from ChirpStack
-🕠 codec_fetcher.py           # Retrieves codec information for devices
-🕠 codec_struct_dec.py        # Decodes structured codec data
-🕠 codec.js                   # JavaScript codec file
-🕠 config.py                  # Stores configuration variables
-🕠 device_fetcher.py          # Fetches devices from ChirpStack
-🕠 device_manager.py          # Manages device storage and updates
-🕠 downlink.py                # Handles downlink messaging
-🕠 event_fetcher_parse.py     # Listens to MQTT events and decodes data
-🕠 http_integration_fetcher.py# Handles HTTP integration with ChirpStack
-🕠 key_rotation.py            # Manages key rotation for encryption
-🕠 main.py                    # Starts the system (scheduler + MQTT listener)
-🕠 README.md                  # Project documentation
-🕠 requirements.txt           # Required dependencies
-🕠 scheduler.py               # Periodically updates device list
-🕠 send_http_request.py       # Handles sending HTTP requests
-🕠 tenant_fetcher.py          # Fetches tenants from ChirpStack
+Honeycomb_Bridge/
+├── api_downlink.py            # Main FastAPI app (container: api) — auth, devices, notifications,
+│                               #   backup/restore, predictive_ML routes; port 4567
+├── config.py                  # Shared configuration / env var loading
+├── captcha_utils.py           # Redis-backed captcha + AES-GCM helpers (login flow)
+├── forgot_password.py         # Password reset token generation/verification
+├── SMTP_init.py                # Login-alert email sender
+├── User_fetcher.py            # Magistrala user lookups
+├── export_openapi.py          # Dumps openapi.json from api_downlink.app
+├── codec.js / test.js         # ChirpStack device-profile payload decoders (Decode/decodeUplink) —
+│                               #   pasted into ChirpStack's codec config, not run by any service here
+├── entrypoint.sh               # api container entrypoint (runs auth.init_db, then uvicorn)
+├── Dockerfile                 # api container image
+├── docker-compose.yml          # Wires all 9 containers together
+├── Makefile                    # docker compose wrappers (build/up/down/logs/sh/migrate/test)
+├── CONTAINERIZATION.md         # Container split rationale — read this for "why" questions
+│
+├── auth/                       # Auth service (container: auth-db is Postgres; code runs inside api)
+│   ├── models.py               #   User model: email, secret, mfa_secret, login_alert_email
+│   ├── database.py             #   SQLAlchemy engine/session (auth-db, port 5435)
+│   ├── auth.py                 #   Auth helpers
+│   ├── schemas.py               #   Pydantic schemas
+│   └── init_db.py              #   Creates tables on startup
+│
+├── iot_worker/                  # container: iot-worker — FastAPI app on :8092
+│   ├── worker.py                #   HTTP API for device commands (internal-token protected)
+│   ├── device_manager.py        #   In-memory device list (euid → codec)
+│   ├── device_fetcher.py        #   Fetches devices from ChirpStack
+│   ├── application_fetcher.py   #   Fetches applications from ChirpStack
+│   ├── tenant_fetcher.py        #   Fetches tenants from ChirpStack
+│   ├── codec_fetcher.py         #   Retrieves device codecs
+│   ├── event_fetcher_parse.py   #   MQTT listener + payload decoder
+│   ├── key_rotation.py          #   ECDH key rotation for device ciphering
+│   ├── User_token.py            #   EdgeX admin/user JWTs, writes edgex_users.json
+│   ├── downlink.py              #   Downlink message sending
+│   ├── scheduler.py             #   Periodic device-list refresh
+│   └── send_http_request.py / http_integration_fetcher.py
+│
+├── Notifications/                # container: notifications-worker
+│   ├── worker.py                 #   Polling loop (every 5s), no HTTP API
+│   ├── edgex_notification_fetcher.py
+│   ├── db_notification/
+│   │   ├── models.py             #   notifications / notification_actions tables
+│   │   └── crud.py
+│   └── schema.py
+│
+├── Timescale_db/                  # container: backup-worker — FastAPI app on :8091
+│   ├── worker.py                  #   Runs backup_scheduler + /reload endpoint (internal-token)
+│   ├── backup_scheduler.py        #   APScheduler: daily sync + NAS export jobs
+│   ├── sync.py                    #   Incremental watermark sync, source → TimescaleDB
+│   ├── reverse_sync.py            #   Restore TimescaleDB → source
+│   ├── secure_export.py           #   Encrypt + SFTP export to NAS
+│   ├── secure_import.py           #   SFTP download + decrypt + restore
+│   ├── transfer_utils.py          #   AES-256-GCM, SHA256, paramiko SFTP helpers
+│   ├── db_config.py               #   Source (Magistrala) / target (TimescaleDB) connections
+│   └── initdb/01_init.sql         #   Schema bootstrap for the timescaledb container
+│
+├── Predictive_ML/                  # container: ml-service — FastAPI app on :8093
+│   ├── worker.py                   #   Training/prediction/GPU-info routes (torch/xgboost/sklearn)
+│   ├── ml/
+│   │   ├── train_service.py
+│   │   ├── prediction.py
+│   │   ├── model_store.py / predition_store.py
+│   │   └── trainers/
+│   ├── fetch_assets_telemetry.py   #   Stays in api — no ML deps needed
+│   ├── telemetry_processor.py
+│   ├── training_dataset_csv_creation.py
+│   └── requirements.txt            #   torch/xgboost/scikit-learn layer on top of the root image
+│
+├── docker-ops-sidecar/              # container: docker-ops-sidecar — FastAPI app on :8097
+│   ├── main.py                      #   docker exec brokering for ChirpStack/EdgeX/Superset ops
+│   └── config.py
+│
+├── alembic/                         # Migrations for auth-db (run manually, not containerized)
+│   └── versions/
+├── tests/                           # pytest suite for iot_worker fetchers/managers
+├── old_code/                        # Pre-container single-process implementation (reference only)
+└── data/training_datasets/          # Shared volume between api and ml-service
 ```
 
 ---
 
-## **📦 Installation & Setup**
-### **1️⃣ Prerequisites**
-Ensure you have:
-- Python **3.10.12**
-- ChirpStack MQTT broker running
-- `pip` installed
+## 🏗️ Architecture
 
-### **2️⃣ Clone the Repository**
+Nine containers, one shared bridge network (`honeycomb-net`), plus the
+external `magistrala-base-net` for reaching ChirpStack/EdgeX/Magistrala:
+
+| # | Container | Port | Source | Role |
+|---|---|---|---|---|
+| 1 | `api` | 4567 | `api_downlink.py`, `auth/` | Public FastAPI surface — stateless, scalable |
+| 2 | `iot-worker` | 8092 | `iot_worker/` | Device polling, MQTT listener, key rotation, EdgeX JWTs |
+| 3 | `notifications-worker` | — | `Notifications/` | EdgeX notification polling loop (no HTTP API) |
+| 4 | `backup-worker` | 8091 | `Timescale_db/` | Scheduled backup/restore jobs (APScheduler) |
+| 5 | `ml-service` | 8093 | `Predictive_ML/` | Model training + inference (torch/xgboost/sklearn) |
+| 6 | `docker-ops-sidecar` | 8097 | `docker-ops-sidecar/` | Only container mounting the Docker socket |
+| 7 | `auth-db` | 5435 | `postgres:15` | Users, MFA secrets, notifications tables |
+| 8 | `timescaledb` | 5436 | `timescale/timescaledb:2.14.2-pg15` | Backup target DB |
+| 9 | `redis` | 6389 | `redis:7-alpine` | Captcha + ML metadata |
+
+ChirpStack and EdgeX run as their own separate Compose stacks and are joined
+via the external `magistrala-base-net` network — bring one of those stacks up
+first so the network exists before `docker compose up` here.
+
+### Why containers talk to each other over HTTP, not in-process
+
+`api_downlink.py` used to import `iot_worker`, `Timescale_db`, and
+`docker-ops-sidecar`-equivalent code directly and call functions in-process.
+Now that each lives in its own container, `api` calls them over HTTP instead,
+authenticated with a shared-secret header (`X-Internal-Token`), one env var
+per callee:
+
+- `iot-worker` → `IOT_WORKER_SHARED_SECRET`
+- `backup-worker` → `BACKUP_WORKER_SHARED_SECRET`
+- `ml-service` → `ML_SERVICE_SHARED_SECRET`
+- `docker-ops-sidecar` → its own internal token, same pattern
+
+### Shared state via bind mounts
+
+A few containers still need to share live files rather than call an API,
+because the state is JSON on disk, not a DB row:
+
+- `api` ↔ `backup-worker` share `./Timescale_db` (schedule.json, history
+  files). `api` calls `backup-worker`'s `POST /reload` after writing/deleting
+  a schedule file so the scheduler picks it up immediately.
+- `api` ↔ `iot-worker` ↔ `notifications-worker` share `./edgex_users.json`
+  (EdgeX admin/user tokens, maintained by `iot_worker/User_token.py`).
+- `api` ↔ `ml-service` share `./data` (training CSVs written by `api`, read
+  back by `ml-service`'s `/train`).
+
+### Communication protocols in play
+
+Not everything is REST-over-`honeycomb-net`. By protocol:
+
+| Protocol | Where | Purpose |
+|---|---|---|
+| HTTP + `X-Internal-Token` | `api` → `iot-worker`/`backup-worker`/`ml-service`/`docker-ops-sidecar` | Internal service calls (see shared secrets above) |
+| HTTP (external) | `api`/`iot-worker` → Magistrala, EdgeX Vault, EdgeX notifications, Superset, MDL Rules Engine | See external dependencies table below |
+| gRPC | `iot_worker/*` (`device_fetcher.py`, `tenant_fetcher.py`, `event_fetcher_parse.py`, `downlink.py`, `key_rotation.py`, `codec_fetcher.py`) → ChirpStack `:8088` | Device/application/tenant CRUD, downlink commands, key rotation |
+| MQTT | `iot_worker/event_fetcher_parse.py` → ChirpStack MQTT broker `:1883` | Subscribes to `application/+/device/+/event/+` for uplink payload decoding |
+| WebSocket | `api_downlink.py` `/downlink/ws/notifications/{status}` | Server push of notification updates to the frontend |
+| SMTP | `SMTP_init.py` → `smtp.gmail.com:587` | Login-alert emails, password/MFA reset links (point back at `FRONTEND_URL`) |
+| `docker exec` (via socket) | `docker-ops-sidecar` → `chirpstack`, `edgex-security-proxy-setup`, `edgex-security-secretstore-setup`, `superset_app` containers | EdgeX user add, ChirpStack API-key creation, reading the Vault root-init token, Superset user create/change-password/reset-password |
+| Redis (TCP) | `api`, `ml-service` → `redis:6389` | Captcha state + AES-GCM login encryption (`captcha_utils.py`); ML model/prediction metadata store (`Predictive_ML/ml/model_store.py`, `predition_store.py`) |
+
+### External dependencies (not in this Compose stack)
+
+Reached via env-configured hostnames, never `localhost`, in production:
+
+- **Magistrala** — main gateway/user-service (`BASE_URL`) and its production TimescaleDB (backup source); a separate **users service** (`USERS_SERVICE_URL`) handles password-reset-without-token
+- **ChirpStack** — gRPC `:8088` (device/app/tenant management), HTTP REST `:8090`
+- **EdgeX Vault** — `:8200` (JWT/OIDC tokens, root-init secret read via sidecar)
+- **EdgeX notifications service** — `:59860` (polled by `notifications-worker`)
+- **Superset** — `:8018` (dashboard user provisioning via sidecar)
+- **MDL Rules Engine** — `https://edge.dev.mdl/rules-engine` (rule list/detail/update, called from `iot_worker/User_token.py`)
+- **Frontend** — `FRONTEND_URL` (`https://honeycomb.dev.mdl/auth`), the target of password/MFA reset links generated by `api`
+
+See [CONTAINERIZATION.md](CONTAINERIZATION.md) for the full container map,
+the reasoning behind each split, and the remaining migration TODOs
+(secrets out of `config.py`, replacing the sidecar's `docker exec` calls with
+real APIs).
+
+---
+
+## 📦 Installation & Setup
+
+### 1️⃣ Prerequisites
+
+- Docker + Docker Compose
+- The `magistrala-base-net` network already exists (bring up the
+  ChirpStack or EdgeX Compose stack first — both declare it)
+- Python 3.10 (only needed for running things outside Docker, e.g. Alembic)
+
+### 2️⃣ Clone the Repository
+
 ```sh
-git clone https://github.com/your-repo/user-application-honeycomb.git
-cd user-application-honeycomb
+git clone https://github.com/your-repo/honeycomb-bridge.git
+cd honeycomb-bridge
 ```
 
-### **3️⃣ Create a Virtual Environment (Recommended)**
+### 3️⃣ Configure environment files
+
+- `.env` — ChirpStack/MQTT/EdgeX hosts, Redis, internal shared-secret tokens
+- `auth/.env.docker` — auth-db `DATABASE_URL` and credentials
+- `Timescale_db/.env` — `SOURCE_DB_*`, `TARGET_DB_*`, `BACKUP_ENCRYPTION_KEY`
+
+### 4️⃣ Build and start the stack
+
 ```sh
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+make build
+make up
+make ps        # check container status
+make logs SERVICE=api   # tail a specific service, or omit SERVICE for all
 ```
 
-### **4️⃣ Install Dependencies**
+### 5️⃣ Run database migrations (auth-db, host-side, out of scope for containers)
+
 ```sh
-pip install -r requirements.txt
-```
-
-### **5️⃣ Configure `config.py`**
-Update `config.py` with your ChirpStack credentials:
-```python
-CHIRPSTACK_HOST = "localhost:8080"  # Update with your host
-AUTH_METADATA = {"Authorization": "Bearer YOUR_TOKEN"}
+make migrate
 ```
 
 ---
 
-## **🚀 How It Works**
-### **🔹 Device Fetching & Management**
-- `device_manager.py` **fetches and stores** devices in `all_devices` (key: `device_name`, value: `{euid, codec}`).
-- `scheduler.py` **refreshes the device list every 10 minutes**.
+## 📋 Running Individual Services (without Docker)
 
-### **🔹 MQTT Event Processing**
-- `event_fetcher_parse.py` **subscribes to ChirpStack MQTT topics**.
-- When an event arrives:
-  - It extracts `dev_eui` and payload data.
-  - It **matches `dev_eui` with `euid` in `all_devices`**.
-  - It retrieves the **correct codec** and decodes the data.
+Each worker also runs as a standalone FastAPI/loop process for local
+development:
 
----
-
-## **📋 Running the Application**
-Start the application by running:
 ```sh
-python main.py
-```
-This will:
-- Start **the scheduler** (to update the device list every 10 minutes).
-- Start **the MQTT listener** (to process incoming sensor events).
-
----
-
-## **⚙️ Code Breakdown**
-### **1️⃣ `device_manager.py`**
-Handles fetching and storing device information:
-```python
-device_manager.fetch_all_devices()  # Fetches all devices
-device_manager.show_device_names()  # Displays the list of devices
-```
-
-### **2️⃣ `scheduler.py`**
-Runs every **10 minutes** to update `all_devices`:
-```python
-schedule.every(10).minutes.do(scheduled_update)
-```
-
-### **3️⃣ `event_fetcher_parse.py`**
-Listens for MQTT events and decodes messages:
-```python
-client.subscribe("application/+/device/+/event/+")
-```
-Matches `dev_eui` with `euid`:
-```python
-def get_device_codec(dev_eui):
-    for device_name, device_info in device_manager.all_devices.items():
-        if device_info.get("euid") == dev_eui:
-            return device_info.get("codec")
-    return None
+python3 -m uvicorn api_downlink:app --host 0.0.0.0 --port 4567
+python3 -m uvicorn iot_worker.worker:app --host 0.0.0.0 --port 8092
+python3 -m uvicorn worker:app --app-dir Timescale_db --host 0.0.0.0 --port 8091
+python3 -m uvicorn Predictive_ML.worker:app --host 0.0.0.0 --port 8093
+python3 -m Notifications.worker
 ```
 
 ---
 
-## **🔧 Debugging & Logs**
-Check **device updates**:
+## 🔧 Debugging & Logs
+
 ```sh
-tail -f scheduler.log
+make logs                        # all containers
+make logs SERVICE=iot-worker     # one container
+make sh SERVICE=api              # shell into a container
 ```
-Check **incoming MQTT messages**:
+
+---
+
+## 🧪 Tests
+
 ```sh
-tail -f event_fetcher.log
+make test
+# or
+pytest -v
 ```
 
 ---
 
-## **📌 Future Enhancements**
-- **Real-time WebSocket integration** for device updates.
-- **Database storage** for historical events.
-- **Custom decoders** for different device types.
+## 📌 Migration Notes
+
+- `old_code/` holds the pre-container, single-process implementation for
+  reference — not run in production.
+- Alembic migrations (`alembic/versions/`) are intentionally **out of scope**
+  for containerization and continue to run manually against the host/auth-db
+  via `make migrate` / `make revision`.
+- See [CONTAINERIZATION.md](CONTAINERIZATION.md) for the outstanding items:
+  moving secrets out of `config.py`, and replacing `docker-ops-sidecar`'s
+  `docker exec` calls with real ChirpStack/Vault/Superset APIs.
 
 ---
 
-## **📝 License**
+## 📝 License
+
 This project is licensed under the **MIT License**.
 
----
-
-## **👨‍💻 Contributing**
-Pull requests are welcome! Open an issue for discussions.
-
-
-
-## **Migrate Database For MFA(Existing instalaltions)**
----
-
-# **Database Migration Guide (Alembic)**
-
-This section explains how to set up and run a database migration using **Alembic** for the Honeycomb User Application.
-
----
-
-## 🧩 **1. Install Dependencies**
-
-Make sure you have a virtual environment activated, then install all required Python packages:
-
-pip install -r requirements.txt
-
----
-
-## ⚙️ **2. Initialize Alembic**
-
-Create a new Alembic migration environment:
-
-alembic init alembic
-
-This will create a folder named **alembic/** and a configuration file **alembic.ini** in your project directory.
-
----
-
-## 🛠️ **3. Configure Database URL**
-
-Open the **alembic.ini** file and verify that the sqlalchemy.url line is configured correctly.
-
-It should look like this (update values as per your local setup):
-
-[alembic]
-# ... don't change anything above ...
-
-sqlalchemy.url = postgresql://myuser:mypassword@localhost:5434/mydatabase
-
----
-
-## 🧬 **4. Update env.py**
-
-Open the file **alembic/env.py** inside the alembic/ directory and make the following changes.
-
-# from myapp import mymodel
-# target_metadata = mymodel.Base.metadata
-
-### 🔹 Add these lines below under the above commented lines (After line 20):
-
-from dotenv import load_dotenv
-load_dotenv()
-
-from auth.database import Base
-target_metadata = Base.metadata
-
-This ensures Alembic can detect your SQLAlchemy models and load environment variables from .env.
-
----
-
-## 🧱 **5. Create a New Migration Revision**
-
-Now, generate a new migration file to add a new column to the users table:
-
-alembic revision -m "add mfa_secret to users"
-
-This command will create a new file under **alembic/versions/**.
-
----
-
-## ✏️ **6. Edit the Generated Revision**
-
-Open the newly created migration file under **alembic/versions/**, and replace its content with the following:
-
-def upgrade():
-    op.add_column('users', sa.Column('mfa_secret', sa.String(length=64), nullable=True))
-
-
-def downgrade():
-    op.drop_column('users', 'mfa_secret')
-
-This defines what happens when you apply (upgrade) or revert (downgrade) the migration.
-
----
-
-## 🚀 **7. Apply the Migration**
-
-Run the migration to update your database schema:
-
-alembic upgrade head
-
-If successful, the new column mfa_secret will be added to the users table.
-
----
-
-
-You’ve successfully completed the Alembic migration setup and applied your first migration.
-
-
----------For second Migration for email alert column----------
-
-## 🧱 **1. Create a New Migration Revision**
-
-Now, generate a new migration file to add a new column to the users table:
-
-alembic revision -m "add loginalert email"
-
-This command will create a new file under **alembic/versions/**.
-
----
-
-## ✏️ **2. Edit the Generated Revision**
-
-Open the newly created migration file under **alembic/versions/**, and replace its content with the following:
-
-def upgrade():
-    op.add_column('users', sa.Column('login_alert_email', sa.String(length=100), nullable=True))
-    pass
-
-
-def downgrade():
-    op.drop_column('users', 'login_alert_email')
-    pass
-
-This defines what happens when you apply (upgrade) or revert (downgrade) the migration.
-
----
-
-## 🚀 **3. Apply the Migration**
-
-Run the migration to update your database schema:
-
-alembic upgrade head
-
-If successful, the new column login_alert_email will be added to the users table.
-
----
-
-You’ve successfully completed the Alembic Second migration.
+## 👨‍💻 Contributing
+
+Pull requests are welcome! Open an issue for discussions. See
+[CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).

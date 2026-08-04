@@ -12,10 +12,8 @@ from pydantic import BaseModel, EmailStr
 config_mod = types.ModuleType("config")
 config_mod.SYMETRIC_CYPHERING = True
 config_mod.FRONTEND_URL = "http://localhost:3000"
-config_mod.CONTAINER_EDGEX_SECURITY_PROXY = "edgex-security-proxy"
-config_mod.CONTAINER_CHIRPSTACK = "chirpstack"
-config_mod.CONTAINER_VAULT = "vault"
-config_mod.VAULT_ROOT_PATH = "/vault/token"
+config_mod.DOCKER_OPS_SIDECAR_URL = "http://docker-ops-sidecar:8097"
+config_mod.SIDECAR_SHARED_SECRET = "stub"
 sys.modules["config"] = config_mod
 
 # ── Real Pydantic schemas (FastAPI needs these for response_model) ─────────────
@@ -49,7 +47,7 @@ schemas_mod.IdentityUpdate = _IdentityUpdate
 
 # ── Mock everything that touches live services ─────────────────────────────────
 _MOCKED = [
-    "event_fetcher_parse", "User_token", "SMTP_init",
+    "iot_worker", "iot_worker.event_fetcher_parse", "iot_worker.User_token", "SMTP_init",
     "auth.models", "auth.database", "auth.auth",
     "forgot_password",
     "Predictive_ML", "Predictive_ML.fetch_assets_telemetry",
