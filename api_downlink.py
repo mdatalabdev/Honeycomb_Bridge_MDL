@@ -1140,6 +1140,21 @@ def _notify_backup_worker_reload() -> None:
         logging.warning(f"Could not notify backup-worker to reload: {e}")
 
 
+def _next_run_from_job(job) -> Optional[str]:
+    """next_run for a Job on this process's own _scheduler, whose scheduler.state is
+    always STATE_STOPPED here (see _schedule_exists_and_next_run). Because of that,
+    add_job() always takes BaseScheduler's "tentative" path (queues into _pending_jobs
+    instead of calling _real_add_job), so the returned Job's next_run_time slot is
+    never assigned — reading job.next_run_time raises AttributeError rather than being
+    merely absent. Compute next_run straight from the trigger instead, which needs no
+    job store or running scheduler.
+    """
+    if not job:
+        return None
+    next_fire = job.trigger.get_next_fire_time(None, datetime.now(job.trigger.timezone))
+    return next_fire.isoformat() if next_fire else None
+
+
 def _schedule_exists_and_next_run(job_id: str, schedule_file: str):
     """Whether a schedule is currently active — based on the persisted JSON file, the
     real source of truth backup-worker reads on /reload, not this process's own
@@ -1147,13 +1162,11 @@ def _schedule_exists_and_next_run(job_id: str, schedule_file: str):
     a same-request next_run preview — start_backup_scheduler() (the call that would
     actually .start() it) runs only inside the backup-worker container, so this
     instance is empty on every fresh `api` process/replica even when a schedule
-    already exists on disk. next_run is therefore best-effort: populated only when
-    this process happens to hold the job in memory (e.g. right after creating it here
-    in this same request).
+    already exists on disk.
     """
     exists = os.path.exists(schedule_file)
     job = _scheduler.get_job(job_id)
-    next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+    next_run = _next_run_from_job(job)
     return exists, next_run
 
 
@@ -2739,6 +2752,10 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
         headers={"Authorization": f"Bearer {edgex_token}"}
     )
     if JWT_responce_edgex.status_code != 200:
+        logging.error(
+            f"Failed to get Edgex JWT for user {edgex_user}: "
+            f"status={JWT_responce_edgex.status_code}, body={JWT_responce_edgex.text}"
+        )
         raise HTTPException(status_code=500, detail="Failed to get Edgex JWT")
     
     edgex_jwt = JWT_responce_edgex.json().get("data", {}).get("token")
@@ -2760,14 +2777,14 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     logging.info(f"First ChirpStack tenant ID: {first_tenant_id}")
     
     # 10. login for superset and get the token
-    
-    superset_username = magistrala_identity
-    superset_password = magistrala_secret
-    
-    # combine {iv,chiphertext and tag into one string with : as separator to send to superset}
-    
-    superset_identity = f"{magistrala_identity['iv']}:{magistrala_identity['ciphertext']}:{magistrala_identity['tag']}"
-    superset_secret = f"{magistrala_secret['iv']}:{magistrala_secret['ciphertext']}:{magistrala_secret['tag']}"
+
+    # Superset accounts are provisioned once with config.encrypted_user/encrypted_pass
+    # (fixed iv/ciphertext/tag) as the username/password — re-encrypting the logged-in
+    # user's own credentials here would produce a different string every call (random
+    # IV per encryption) and could never match what the Superset account was created with.
+
+    superset_identity = f"{config.encrypted_user['iv']}:{config.encrypted_user['ciphertext']}:{config.encrypted_user['tag']}"
+    superset_secret = f"{config.encrypted_pass['iv']}:{config.encrypted_pass['ciphertext']}:{config.encrypted_pass['tag']}"
     
     superset_login_response = requests.post(
         f"{config.SUPERSET_BASE_URL}/api/v1/security/login",
@@ -2778,6 +2795,10 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
             "refresh": True
         })
     if superset_login_response.status_code != 200:
+        logging.error(
+            f"Failed to authenticate with Superset: "
+            f"status={superset_login_response.status_code}, body={superset_login_response.text}"
+        )
         raise HTTPException(status_code=500, detail="Failed to authenticate with Superset")
     
     superset_access_token = superset_login_response.json().get("access_token")
@@ -3375,7 +3396,7 @@ def set_restore_schedule(req: RestoreScheduleRequest, current_user=Depends(auth.
         _notify_backup_worker_reload()
 
         job = _scheduler.get_job("daily_restore")
-        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+        next_run = _next_run_from_job(job)
 
         return {
             "status": "Scheduled",
@@ -3619,7 +3640,7 @@ def set_backup_schedule(req: BackupScheduleRequest, current_user=Depends(auth.ge
         _notify_backup_worker_reload()
 
         job = _scheduler.get_job("daily_backup")
-        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+        next_run = _next_run_from_job(job)
 
         return {
             "status": "Scheduled",
@@ -3758,7 +3779,7 @@ def set_nas_schedule(req: NasScheduleRequest, current_user=Depends(auth.get_curr
         _notify_backup_worker_reload()
 
         job = _scheduler.get_job("daily_nas_backup")
-        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+        next_run = _next_run_from_job(job)
 
         return {
             "status": "Scheduled",
@@ -4090,7 +4111,7 @@ def _import_schedule_post(req: ImportScheduleRequest, target: str,
         _notify_backup_worker_reload()
 
         job = _scheduler.get_job(job_id)
-        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+        next_run = _next_run_from_job(job)
 
         return {
             "status": "Scheduled",
